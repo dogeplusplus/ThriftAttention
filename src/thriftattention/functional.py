@@ -4,7 +4,11 @@ import torch
 
 from ._checks import check_qkv, require_block_aligned, require_causal
 from ._extension import get_extension
-from .quantization import nvfp4_quantize, nvfp4_quantize_transposed
+from .quantization import (
+    nvfp4_quantize,
+    nvfp4_quantize_permuted,
+    nvfp4_quantize_transposed,
+)
 from .selection import select_block_pairs
 
 
@@ -14,7 +18,7 @@ def _quantize_qkv(
     v: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q_packed, q_scale = nvfp4_quantize(q)
-    k_packed, k_scale = nvfp4_quantize(k)
+    k_packed, k_scale = nvfp4_quantize_permuted(k)
     v_packed_t, v_scale_t = nvfp4_quantize_transposed(v)
     return q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t
 

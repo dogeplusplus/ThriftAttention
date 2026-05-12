@@ -32,6 +32,16 @@ __host__ __device__ inline int ta_sage_perm_seq(int x, bool inverse = false) {
     return base + (inverse ? ta_sage_perm32_inv(local) : ta_sage_perm32(local));
 }
 
+// K/V are stored in the physical order consumed by the shuffle-free P operand.
+// This names the direction used by the quantizers and causal masks explicitly.
+__host__ __device__ inline int ta_kv_logical_from_physical(int physical) {
+    return ta_sage_perm_seq(physical, false);
+}
+
+__host__ __device__ inline int ta_kv_physical_from_logical(int logical) {
+    return ta_sage_perm_seq(logical, true);
+}
+
 template <int STRIDE>
 __device__ inline uint32_t ta_swizzle(uint32_t index) {
     if constexpr (STRIDE == 16) {

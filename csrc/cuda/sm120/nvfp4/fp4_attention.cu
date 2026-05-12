@@ -211,8 +211,8 @@ void fp4_attention_causal_kernel(
                 for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
                     const int k_phys_0 = mma_id_kv * MMA_N + k_col_base;
                     const int k_phys_1 = k_phys_0 + 1;
-                    const int k_col_0 = k_block_start + k_phys_0;
-                    const int k_col_1 = k_block_start + k_phys_1;
+                    const int k_col_0 = k_block_start + ta_kv_logical_from_physical(k_phys_0);
+                    const int k_col_1 = k_block_start + ta_kv_logical_from_physical(k_phys_1);
 
                     // regs[0]: (q_row_upper, k_col_0), regs[1]: (q_row_upper, k_col_1)
                     // regs[2]: (q_row_lower, k_col_0), regs[3]: (q_row_lower, k_col_1)
@@ -232,26 +232,15 @@ void fp4_attention_causal_kernel(
 
             // rowmax over this KV block
             float this_rowmax[2] = {-FLT_MAX, -FLT_MAX};
-            float p_group_max_upper[BLOCK_KV / MMA_N / 2];
-            float p_group_max_lower[BLOCK_KV / MMA_N / 2];
-            for (int blk = 0; blk < BLOCK_KV / MMA_N / 2; blk++) {
-                const int t0 = 2 * blk;
-                const int t1 = t0 + 1;
-                float gmax_upper = max(
-                    max(S_rmem[mma_id_q][t0][0], S_rmem[mma_id_q][t0][1]),
-                    max(S_rmem[mma_id_q][t1][0], S_rmem[mma_id_q][t1][1]));
-                float gmax_lower = max(
-                    max(S_rmem[mma_id_q][t0][2], S_rmem[mma_id_q][t0][3]),
-                    max(S_rmem[mma_id_q][t1][2], S_rmem[mma_id_q][t1][3]));
-                gmax_upper = max(gmax_upper, __shfl_xor_sync(0xFFFFFFFF, gmax_upper, 1));
-                gmax_upper = max(gmax_upper, __shfl_xor_sync(0xFFFFFFFF, gmax_upper, 2));
-                gmax_lower = max(gmax_lower, __shfl_xor_sync(0xFFFFFFFF, gmax_lower, 1));
-                gmax_lower = max(gmax_lower, __shfl_xor_sync(0xFFFFFFFF, gmax_lower, 2));
-                p_group_max_upper[blk] = gmax_upper;
-                p_group_max_lower[blk] = gmax_lower;
-                this_rowmax[0] = max(this_rowmax[0], gmax_upper);
-                this_rowmax[1] = max(this_rowmax[1], gmax_lower);
+            for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+                float *regs = S_rmem[mma_id_q][mma_id_kv];
+                this_rowmax[0] = max(this_rowmax[0], max(regs[0], regs[1]));
+                this_rowmax[1] = max(this_rowmax[1], max(regs[2], regs[3]));
             }
+            this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[0], 1));
+            this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[0], 2));
+            this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 1));
+            this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 2));
 
             // new rowmax
             this_rowmax[0] = max(this_rowmax[0], rowmax[mma_id_q][0]);
@@ -303,8 +292,8 @@ void fp4_attention_causal_kernel(
             for (int blk = 0; blk < BLOCK_KV / MMA_N /2 ; blk++) {
                 const int t0 = 2 * blk;
                 const int t1 = t0 + 1;
-                const float gmax_upper = p_group_max_upper[blk];
-                const float gmax_lower = p_group_max_lower[blk];
+                const float gmax_upper = rowmax[mma_id_q][0];
+                const float gmax_lower = rowmax[mma_id_q][1];
                 const bool valid_upper = gmax_upper > -FLT_MAX * 0.5f;
                 const bool valid_lower = gmax_lower > -FLT_MAX * 0.5f;
                 const float inv_upper = valid_upper ? (FP4_MAX * __expf(rowmax[mma_id_q][0] - gmax_upper)) : 0.0f;
@@ -322,30 +311,7 @@ void fp4_attention_causal_kernel(
                 S_rmem[mma_id_q][t1][3] *= inv_lower;
             }
 
-            const int qid = lane_id & 3;
             for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {
-                for (int r = 0; r < 4; r++) {
-                    float send = (qid & 1) ? S_rmem[mma_id_q][g * 4 + 0][r] : S_rmem[mma_id_q][g * 4 + 1][r];
-                    float recv = __shfl_xor_sync(0xFFFFFFFF, send, 1);
-                    if (qid & 1) S_rmem[mma_id_q][g * 4 + 0][r] = recv;
-                    else         S_rmem[mma_id_q][g * 4 + 1][r] = recv;
-
-                    send = (qid & 1) ? S_rmem[mma_id_q][g * 4 + 2][r] : S_rmem[mma_id_q][g * 4 + 3][r];
-                    recv = __shfl_xor_sync(0xFFFFFFFF, send, 1);
-                    if (qid & 1) S_rmem[mma_id_q][g * 4 + 2][r] = recv;
-                    else         S_rmem[mma_id_q][g * 4 + 3][r] = recv;
-
-                    send = (qid & 2) ? S_rmem[mma_id_q][g * 4 + 0][r] : S_rmem[mma_id_q][g * 4 + 2][r];
-                    recv = __shfl_xor_sync(0xFFFFFFFF, send, 2);
-                    if (qid & 2) S_rmem[mma_id_q][g * 4 + 0][r] = recv;
-                    else         S_rmem[mma_id_q][g * 4 + 2][r] = recv;
-
-                    send = (qid & 2) ? S_rmem[mma_id_q][g * 4 + 1][r] : S_rmem[mma_id_q][g * 4 + 3][r];
-                    recv = __shfl_xor_sync(0xFFFFFFFF, send, 2);
-                    if (qid & 2) S_rmem[mma_id_q][g * 4 + 1][r] = recv;
-                    else         S_rmem[mma_id_q][g * 4 + 3][r] = recv;
-                }
-
                 int blk = 4 * g;
                 float *r0 = S_rmem[mma_id_q][blk];
                 float *r1 = S_rmem[mma_id_q][blk + 1];
