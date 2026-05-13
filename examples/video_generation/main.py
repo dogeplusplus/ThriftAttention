@@ -24,6 +24,10 @@ DEFAULT_PROMPT = "A small robot painting a city skyline at sunset, cinematic, de
 class AttentionStats:
     accelerated_calls: int = 0
     fallback_calls: int = 0
+    max_accelerated_q: int = 0
+    max_accelerated_k: int = 0
+    max_fallback_q: int = 0
+    max_fallback_k: int = 0
 
 
 class ThriftVideoAttnProcessor:
@@ -79,16 +83,13 @@ class ThriftVideoAttnProcessor:
             else:
                 hidden_states = ta.fp4_attention(query, key, value, causal=False)
             self.stats.accelerated_calls += 1
+            self.stats.max_accelerated_q = max(self.stats.max_accelerated_q, query.shape[2])
+            self.stats.max_accelerated_k = max(self.stats.max_accelerated_k, key.shape[2])
         else:
-            hidden_states = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=attention_mask,
-                dropout_p=0.0,
-                is_causal=False,
-            )
+            hidden_states = _scaled_dot_product_attention(query, key, value, attention_mask=attention_mask)
             self.stats.fallback_calls += 1
+            self.stats.max_fallback_q = max(self.stats.max_fallback_q, query.shape[2])
+            self.stats.max_fallback_k = max(self.stats.max_fallback_k, key.shape[2])
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, query.shape[1] * query.shape[-1])
         hidden_states = hidden_states.to(query.dtype)
@@ -156,6 +157,39 @@ def _heads_first(hidden_states: torch.Tensor, heads: int) -> torch.Tensor:
     batch, sequence_length, inner_dim = hidden_states.shape
     head_dim = inner_dim // heads
     return hidden_states.view(batch, sequence_length, heads, head_dim).transpose(1, 2).contiguous()
+
+
+def _math_sdp_enabled() -> Any:
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        return sdpa_kernel([SDPBackend.MATH])
+    except Exception:
+        return contextlib.nullcontext()
+
+
+def _scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    attention_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    # Large videos make temporal attention look like a huge batch of tiny
+    # sequences. PyTorch's flash SDPA backend can reject that launch shape, while
+    # the math path is cheap for these short temporal sequences.
+    effective_batches = query.shape[0] * query.shape[1]
+    short_sequence = max(query.shape[2], key.shape[2]) <= 64
+    context = _math_sdp_enabled() if short_sequence and effective_batches >= 4096 else contextlib.nullcontext()
+    with context:
+        return F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+        )
 
 
 def _set_attention_processor(pipe: Any, processor: ThriftVideoAttnProcessor) -> None:
@@ -288,31 +322,41 @@ def main() -> None:
     unknown_modes = sorted(set(requested_modes) - {"flash", "thrift", "fp4"})
     if unknown_modes:
         raise SystemExit(f"unknown modes: {', '.join(unknown_modes)}")
-    modes = ["flash"] + [mode for mode in requested_modes if mode != "flash"]
+    modes = requested_modes
 
     reference_frames: list[np.ndarray] | None = None
-    print("mode      wall_s   speedup  psnr_db  rmse     mae      accelerated/fallback")
-    print("--------  -------  -------  -------  -------  -------  --------------------")
+    baseline_elapsed: float | None = None
+    print("mode      wall_s   speedup  psnr_db  rmse     mae      accelerated/fallback  max_accel_q/k  max_fallback_q/k")
+    print("--------  -------  -------  -------  -------  -------  --------------------  -------------  ----------------")
     for mode in modes:
         elapsed, frames, stats = _run_once(pipe, args, mode)
         _save_video(frames, args.output_dir / f"{mode}.mp4", args.fps)
 
         if mode == "flash":
             reference_frames = frames
-            speedup = 1.0
+            speedup_text = f"{1.0:7.3f}"
             quality = {"psnr": float("inf"), "rmse": 0.0, "mae": 0.0}
             baseline_elapsed = elapsed
         else:
-            if reference_frames is None:
-                raise RuntimeError("flash reference frames were not generated")
-            quality = _quality(reference_frames, frames)
-            speedup = baseline_elapsed / elapsed
+            if reference_frames is None or baseline_elapsed is None:
+                quality = None
+                speedup_text = f"{'n/a':>7}"
+            else:
+                quality = _quality(reference_frames, frames)
+                speedup_text = f"{baseline_elapsed / elapsed:7.3f}"
 
-        psnr = "inf" if math.isinf(quality["psnr"]) else f"{quality['psnr']:.3f}"
+        if quality is None:
+            psnr = rmse = mae = "n/a"
+        else:
+            psnr = "inf" if math.isinf(quality["psnr"]) else f"{quality['psnr']:.3f}"
+            rmse = f"{quality['rmse']:.5f}"
+            mae = f"{quality['mae']:.5f}"
         print(
-            f"{mode:<8}  {elapsed:7.3f}  {speedup:7.3f}  {psnr:>7}  "
-            f"{quality['rmse']:.5f}  {quality['mae']:.5f}  "
-            f"{stats.accelerated_calls}/{stats.fallback_calls}"
+            f"{mode:<8}  {elapsed:7.3f}  {speedup_text}  {psnr:>7}  "
+            f"{rmse:>7}  {mae:>7}  "
+            f"{stats.accelerated_calls}/{stats.fallback_calls}  "
+            f"{stats.max_accelerated_q}/{stats.max_accelerated_k}  "
+            f"{stats.max_fallback_q}/{stats.max_fallback_k}"
         )
 
     print(f"\nwrote videos to {args.output_dir}")
