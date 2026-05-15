@@ -9,6 +9,10 @@
 
 namespace {
 
+constexpr int SQ_TOPK_CHUNK_BLOCKS = 64;
+constexpr int SQ_TOPK_LOCAL_WARPS = 8;
+constexpr int SQ_TOPK_LOCAL_THREADS = SQ_TOPK_LOCAL_WARPS * TA_WARP_SIZE;
+
 // Per-query-block selection.
 //
 // q_mean: [flat_heads, num_q_blocks, head_dim]
@@ -213,6 +217,187 @@ void single_query_key_mean_topk_kernel(
     }
 }
 
+// Chunk-parallel exact single-query selection. Each local CTA scores a
+// contiguous 64-block chunk for one KV head, emits that chunk's local top-k,
+// then the last completed chunk CTA merges the final top-k from all local
+// candidates. Keeping top-k candidates per chunk is exact: any global top-k
+// element must be in the top-k of its own chunk.
+template<int HEAD_DIM>
+__global__ __launch_bounds__(SQ_TOPK_LOCAL_THREADS)
+void single_query_key_mean_topk_local_kernel(
+    const half* __restrict__ q_grouped,
+    const half* __restrict__ k_mean,
+    int32_t* __restrict__ topk_out,
+    float* __restrict__ local_scores,
+    int32_t* __restrict__ local_indices,
+    int32_t* __restrict__ done_counts,
+    int groups,
+    int num_kv_blocks,
+    int k_mean_capacity_blocks,
+    int chunk_count,
+    int local_count,
+    int topk_count) {
+    constexpr int ELEMS_PER_LANE = HEAD_DIM / TA_WARP_SIZE;
+    constexpr int ITEMS_PER_LANE = SQ_TOPK_CHUNK_BLOCKS / TA_WARP_SIZE;
+
+    const int chunk_id = blockIdx.x % chunk_count;
+    const int flat_head_id = blockIdx.x / chunk_count;
+    const int chunk_start = chunk_id * SQ_TOPK_CHUNK_BLOCKS;
+    const int tid = threadIdx.x;
+    const int lane_id = tid & (TA_WARP_SIZE - 1);
+    const int warp_id = tid / TA_WARP_SIZE;
+
+    __shared__ float block_scores[SQ_TOPK_CHUNK_BLOCKS];
+    if (tid < SQ_TOPK_CHUNK_BLOCKS) {
+        block_scores[tid] = -FLT_MAX;
+    }
+    __syncthreads();
+
+    const half* q_head =
+        q_grouped + static_cast<int64_t>(flat_head_id) * groups * HEAD_DIM;
+    const half* k_head =
+        k_mean + static_cast<int64_t>(flat_head_id) * k_mean_capacity_blocks * HEAD_DIM;
+
+    for (int local_block = warp_id; local_block < SQ_TOPK_CHUNK_BLOCKS;
+         local_block += SQ_TOPK_LOCAL_WARPS) {
+        const int kv_block = chunk_start + local_block;
+        float best = -FLT_MAX;
+
+        if (kv_block < num_kv_blocks) {
+            const half* k_row = k_head + static_cast<int64_t>(kv_block) * HEAD_DIM;
+            for (int group_id = 0; group_id < groups; group_id++) {
+                const half* q_row = q_head + group_id * HEAD_DIM;
+                float dot = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < ELEMS_PER_LANE; i++) {
+                    const int elem = lane_id + i * TA_WARP_SIZE;
+                    dot += __half2float(q_row[elem]) * __half2float(k_row[elem]);
+                }
+
+                #pragma unroll
+                for (int delta = 16; delta >= 1; delta >>= 1) {
+                    dot += __shfl_xor_sync(0xFFFFFFFF, dot, delta);
+                }
+
+                if (lane_id == 0 && dot > best) {
+                    best = dot;
+                }
+            }
+        }
+
+        if (lane_id == 0) {
+            block_scores[local_block] = best;
+        }
+    }
+    __syncthreads();
+
+    if (warp_id != 0) {
+        return;
+    }
+
+    float values[ITEMS_PER_LANE];
+    int indices[ITEMS_PER_LANE];
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_LANE; i++) {
+        const int local_idx = i * TA_WARP_SIZE + lane_id;
+        const int global_idx = chunk_start + local_idx;
+        indices[i] = global_idx;
+        values[i] = (global_idx < num_kv_blocks) ? block_scores[local_idx] : -FLT_MAX;
+    }
+
+    const int64_t local_base =
+        (static_cast<int64_t>(flat_head_id) * chunk_count + chunk_id) * local_count;
+    for (int rank = 0; rank < local_count; rank++) {
+        float best = values[0];
+        int best_idx = indices[0];
+        #pragma unroll
+        for (int i = 1; i < ITEMS_PER_LANE; i++) {
+            if (values[i] > best) {
+                best = values[i];
+                best_idx = indices[i];
+            }
+        }
+
+        #pragma unroll
+        for (int delta = 16; delta >= 1; delta >>= 1) {
+            const float other = __shfl_xor_sync(0xFFFFFFFF, best, delta);
+            const int other_idx = __shfl_xor_sync(0xFFFFFFFF, best_idx, delta);
+            if (other > best) {
+                best = other;
+                best_idx = other_idx;
+            }
+        }
+
+        const bool found = best > -FLT_MAX * 0.5f;
+        if (lane_id == 0) {
+            local_scores[local_base + rank] = found ? best : -FLT_MAX;
+            local_indices[local_base + rank] = found ? best_idx : -1;
+        }
+        best_idx = __shfl_sync(0xFFFFFFFF, best_idx, 0);
+
+        #pragma unroll
+        for (int i = 0; i < ITEMS_PER_LANE; i++) {
+            if (found && indices[i] == best_idx) {
+                values[i] = -FLT_MAX;
+            }
+        }
+    }
+    __syncthreads();
+
+    __shared__ int is_last_chunk;
+    if (warp_id == 0 && lane_id == 0) {
+        __threadfence();
+        const int prior = atomicAdd(done_counts + flat_head_id, 1);
+        is_last_chunk = (prior == chunk_count - 1);
+    }
+    __syncthreads();
+
+    if (!is_last_chunk || warp_id != 0) {
+        return;
+    }
+
+    const int candidate_count = chunk_count * local_count;
+    const int64_t candidate_base = static_cast<int64_t>(flat_head_id) * candidate_count;
+
+    for (int rank = 0; rank < topk_count; rank++) {
+        float thread_best = -FLT_MAX;
+        int thread_best_idx = -1;
+
+        for (int candidate = lane_id; candidate < candidate_count; candidate += TA_WARP_SIZE) {
+            const int64_t offset = candidate_base + candidate;
+            const int idx = local_indices[offset];
+            const float score = local_scores[offset];
+            if (idx >= 0 && score > thread_best) {
+                thread_best = score;
+                thread_best_idx = idx;
+            }
+        }
+
+        #pragma unroll
+        for (int delta = 16; delta >= 1; delta >>= 1) {
+            const float other_score = __shfl_down_sync(0xFFFFFFFF, thread_best, delta);
+            const int other_idx = __shfl_down_sync(0xFFFFFFFF, thread_best_idx, delta);
+            if (lane_id + delta < TA_WARP_SIZE && other_score > thread_best) {
+                thread_best = other_score;
+                thread_best_idx = other_idx;
+            }
+        }
+
+        if (lane_id == 0) {
+            topk_out[static_cast<int64_t>(flat_head_id) * topk_count + rank] = thread_best_idx;
+        }
+        const int selected_idx = __shfl_sync(0xFFFFFFFF, thread_best_idx, 0);
+
+        for (int candidate = lane_id; candidate < candidate_count; candidate += TA_WARP_SIZE) {
+            const int64_t offset = candidate_base + candidate;
+            if (local_indices[offset] == selected_idx) {
+                local_scores[offset] = -FLT_MAX;
+            }
+        }
+        __syncwarp();
+    }
+}
+
 template<bool CAUSAL, int HEAD_DIM, int MAX_KV_BLOCKS>
 void launch_block_mean_topk(
     const half* q_mean,
@@ -312,6 +497,37 @@ void dispatch_single_query_key_mean_topk(
     }
 }
 
+template<int HEAD_DIM>
+void launch_single_query_key_mean_topk_chunked(
+    const half* q_grouped,
+    const half* k_mean,
+    int32_t* topk_out,
+    float* local_scores,
+    int32_t* local_indices,
+    int32_t* done_counts,
+    int flat_heads,
+    int groups,
+    int num_kv_blocks,
+    int k_mean_capacity_blocks,
+    int topk_count,
+    int chunk_count,
+    int local_count) {
+    cudaMemsetAsync(done_counts, 0, static_cast<size_t>(flat_heads) * sizeof(int32_t));
+
+    const int local_grid = flat_heads * chunk_count;
+    single_query_key_mean_topk_local_kernel<HEAD_DIM>
+        <<<local_grid, SQ_TOPK_LOCAL_THREADS>>>(
+            q_grouped, k_mean, topk_out, local_scores, local_indices, done_counts,
+            groups, num_kv_blocks, k_mean_capacity_blocks, chunk_count, local_count,
+            topk_count);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "single_query_key_mean_topk_local kernel launch failed: %s\n",
+                cudaGetErrorString(err));
+    }
+}
+
 }  // namespace
 
 void block_mean_topk(
@@ -384,6 +600,52 @@ void single_query_key_mean_topk(
             k_mean_capacity_blocks, topk_count);
     } else {
         fprintf(stderr, "single_query_key_mean_topk: unsupported head_dim=%d\n", head_dim);
+    }
+}
+
+void single_query_key_mean_topk_chunked(
+    const void* q_grouped_raw,
+    const void* k_mean_raw,
+    void* topk_out_raw,
+    void* local_scores_raw,
+    void* local_indices_raw,
+    void* done_counts_raw,
+    int flat_heads,
+    int groups,
+    int num_kv_blocks,
+    int k_mean_capacity_blocks,
+    int head_dim,
+    int topk_count,
+    int chunk_count,
+    int local_count) {
+    const half* q_grouped = reinterpret_cast<const half*>(q_grouped_raw);
+    const half* k_mean = reinterpret_cast<const half*>(k_mean_raw);
+    int32_t* topk_out = reinterpret_cast<int32_t*>(topk_out_raw);
+    float* local_scores = reinterpret_cast<float*>(local_scores_raw);
+    int32_t* local_indices = reinterpret_cast<int32_t*>(local_indices_raw);
+    int32_t* done_counts = reinterpret_cast<int32_t*>(done_counts_raw);
+
+    if (num_kv_blocks > 2048) {
+        fprintf(stderr, "single_query_key_mean_topk_chunked: num_kv_blocks=%d > 2048 not supported\n",
+                num_kv_blocks);
+        return;
+    }
+    if (chunk_count <= 0 || local_count <= 0) {
+        return;
+    }
+
+    if (head_dim == 64) {
+        launch_single_query_key_mean_topk_chunked<64>(
+            q_grouped, k_mean, topk_out, local_scores, local_indices, done_counts,
+            flat_heads, groups, num_kv_blocks, k_mean_capacity_blocks,
+            topk_count, chunk_count, local_count);
+    } else if (head_dim == 128) {
+        launch_single_query_key_mean_topk_chunked<128>(
+            q_grouped, k_mean, topk_out, local_scores, local_indices, done_counts,
+            flat_heads, groups, num_kv_blocks, k_mean_capacity_blocks,
+            topk_count, chunk_count, local_count);
+    } else {
+        fprintf(stderr, "single_query_key_mean_topk_chunked: unsupported head_dim=%d\n", head_dim);
     }
 }
 

@@ -1,6 +1,11 @@
 transformers>=4.52
-datasets>=2.19
 accelerate>=0.30
 sentencepiece>=0.2
-matplotlib>=3.8
-PyYAML>=6.0
+numpy>=1.26
+wonderwords>=2.2
+nltk>=3.8
+beautifulsoup4>=4.12
+html2text>=2024.2.26
+huggingface_hub>=0.23
+pandas>=2.0
+pyarrow>=15.0

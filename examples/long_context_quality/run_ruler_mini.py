@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from statistics import fmean
 from typing import Any
@@ -14,272 +17,340 @@ if str(EXAMPLES_ROOT) not in sys.path:
 
 from common import (  # noqa: E402
     collect_environment,
-    load_config,
     make_output_dir,
     markdown_table,
     parse_int_list,
     parse_str_list,
     set_seed,
+    sync_cuda,
     thrift_acceleration_status,
-    timed_call,
     write_json,
     write_jsonl,
 )
-from common.cli import pick  # noqa: E402
 
 
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
-DEFAULT_TASKS = "needle,variable_tracking,common_words"
-DEFAULT_METHODS = "fp16,fp4,thrift"
-VALID_TASKS = {"needle", "variable_tracking", "common_words"}
-VALID_METHODS = {"fp16": "fp16_flash", "flash": "fp16_flash", "fp16_flash": "fp16_flash", "fp4": "fp4", "thrift": "thrift"}
+METHODS = {"fp16": "fp16", "flash": "fp16", "fp4": "fp4", "thrift": "thrift"}
+TASK_ALIASES = {"needle": "niah_single_1", "variable_tracking": "vt", "common_words": "cwe"}
+DEFAULT_RULER_DIR = Path(os.environ.get("RULER_EXPERIMENTS_DIR", "/workspace/nvfp4-experiments/experiments"))
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Tiny synthetic RULER-style generation benchmark for long-context smoke testing.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--preset", default="quick", choices=["quick"])
-    parser.add_argument("--config", type=Path, default=None)
-    parser.add_argument("--model", default=None)
-    parser.add_argument("--lengths", default=None)
-    parser.add_argument("--tasks", default=None)
-    parser.add_argument("--methods", default=None)
-    parser.add_argument("--fraction", type=float, default=None)
-    parser.add_argument("--num-examples", type=int, default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=None)
-    parser.add_argument("--output", type=Path, default=None)
-    parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--device", default=None)
+    parser = argparse.ArgumentParser(description="Mini RULER generation benchmark with explicit prefill/decode timing.")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--lengths", default="4096,8192")
+    parser.add_argument("--tasks", default="niah_single_1,vt,cwe")
+    parser.add_argument("--methods", default="fp16,fp4,thrift")
+    parser.add_argument("--fractions", default="0.05")
+    parser.add_argument("--num-examples", type=int, default=3)
+    parser.add_argument("--max-new-tokens", type=int, default=0, help="0 uses each RULER task's default generation length.")
+    parser.add_argument("--ruler-dir", type=Path, default=DEFAULT_RULER_DIR, help="Directory containing ruler_gen.py and ruler_score.py.")
+    parser.add_argument("--cache-dir", type=Path, default=None, help="RULER sample cache directory.")
+    parser.add_argument("--output", type=Path, default=None, help="Optional output directory for metrics.jsonl and summary.md.")
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--device", default="cuda")
     return parser.parse_args()
 
 
-def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
-    config_path = args.config or Path(__file__).parent / "configs" / "ruler_quick.yaml"
-    config = load_config(config_path)
-    args.config_path = str(config_path)
-    args.model = pick("model", args.model, config, DEFAULT_MODEL, str)
-    args.lengths = pick("lengths", args.lengths, config, [4096, 8192], parse_int_list)
-    args.tasks = [task.strip() for task in pick("tasks", args.tasks, config, DEFAULT_TASKS, parse_str_list)]
-    args.methods = [_normalise_method(method) for method in pick("methods", args.methods, config, DEFAULT_METHODS, parse_str_list)]
-    args.fraction = pick("fraction", args.fraction, config, 0.05, float)
-    args.num_examples = pick("num_examples", args.num_examples, config, 1, int)
-    args.max_new_tokens = pick("max_new_tokens", args.max_new_tokens, config, 24, int)
-    args.output = Path(pick("output", args.output, config, Path("results/long_context_quality"), Path))
-    args.seed = pick("seed", args.seed, config, 1234, int)
-    args.device = pick("device", args.device, config, "cuda", str)
-    unknown = sorted(set(args.tasks) - VALID_TASKS)
-    if unknown:
-        raise SystemExit(f"unknown task(s): {', '.join(unknown)}")
-    return args
+def method_runs(methods: str, fractions: str) -> list[dict[str, Any]]:
+    frac_values = [float(item) for item in fractions.replace(" ", ",").split(",") if item.strip()]
+    if not frac_values:
+        raise SystemExit("--fractions must contain at least one value")
+    out = []
+    for raw in parse_str_list(methods):
+        method = METHODS.get(raw.lower())
+        if method is None:
+            raise SystemExit(f"unknown method {raw!r}; choose fp16, fp4, thrift")
+        if method == "thrift":
+            for frac in frac_values:
+                if not 0.0 <= frac <= 1.0:
+                    raise SystemExit("--fractions must be in [0, 1]")
+                out.append({"method": method, "label": f"thrift_{frac * 100:g}pct".replace(".", "p"), "fraction": frac})
+        else:
+            out.append({"method": method, "label": method, "fraction": None})
+    if not out:
+        raise SystemExit("--methods must contain at least one method")
+    return out
 
 
-def _normalise_method(method: str) -> str:
-    key = method.lower().strip()
-    if key not in VALID_METHODS:
-        raise SystemExit(f"unknown method {method!r}; choose from fp16, fp4, thrift")
-    return VALID_METHODS[key]
-
-
-def require_transformers() -> None:
-    try:
-        __import__("transformers")
-    except Exception:
-        raise SystemExit(
-            "Missing Transformers. Install with `pip install -r examples/long_context_quality/requirements.txt` "
-            "or `pip install -e '.[hf]'`."
-        )
-
-
-def load_model_and_tokenizer(args: argparse.Namespace) -> tuple[Any, Any]:
+def load_model(model_id: str, device: str) -> tuple[Any, Any]:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    if args.device.startswith("cuda") and not torch.cuda.is_available():
-        raise SystemExit("CUDA was requested but is not available. Use `--device cpu` for fp16-only smoke runs.")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise SystemExit("CUDA was requested but is not available.")
+    dtype = torch.float16 if device.startswith("cuda") else torch.float32
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
-    dtype = torch.float16 if args.device.startswith("cuda") else torch.float32
-    model = None
-    if args.device.startswith("cuda"):
-        try:
-            model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype, device_map={"": args.device})
-        except Exception as exc:
-            print(f"device_map load failed ({exc}); retrying with explicit .to({args.device}).")
-    if model is None:
-        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype)
-        model.to(args.device)
-    model.eval()
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype).to(device).eval()
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype).to(device).eval()
     return model, tokenizer
 
 
-def configure_method(model: Any, method: str, args: argparse.Namespace, thrift_ready: bool, thrift_note: str) -> tuple[bool, str]:
+def configure(model: Any, method: str, fraction: float | None, device: str) -> tuple[bool, str, Any | None]:
     import thriftattention as ta
 
     try:
         ta.unpatch_model(model, backend="hf")
     except Exception:
         pass
-    if method == "fp16_flash":
-        return True, "using model's standard Transformers attention implementation"
-    if not thrift_ready:
-        return False, thrift_note
+    if method == "fp16":
+        return True, "standard Transformers attention", None
+    ready, note = thrift_acceleration_status(device)
+    if not ready:
+        return False, note, None
     try:
-        ta.patch_model(model, backend="hf", mode="fp4" if method == "fp4" else "thrift", causal=True, fp16_fraction=args.fraction)
+        from thriftattention.config import AttentionConfig
+
+        mode = "fp4" if method == "fp4" else "thrift"
+        config = AttentionConfig(mode=mode, fp16_fraction=0.0 if fraction is None else fraction, backend="hf", patch_generation=False)
+        ta.patch_model(model, backend="hf", mode=mode, fp16_fraction=config.fp16_fraction, patch_generation=False)
     except Exception as exc:
-        return False, f"could not enable {method}: {exc}"
-    return True, f"enabled {method}"
+        return False, str(exc), None
+    return True, f"patched {method}" if method == "fp4" else f"patched thrift fraction={fraction:g}", config
 
 
-def build_task_input(tokenizer: Any, task: str, length: int, seed: int) -> tuple[list[int], str]:
-    import random
+def set_model_attention_config(model: Any, config: Any) -> None:
+    from thriftattention.integrations import transformers as hf
 
-    rng = random.Random(seed)
-    if task == "needle":
-        answer = f"K{rng.randrange(100000, 999999)}"
-        head = f"A useful fact is hidden here. The retrieval key is {answer}. Remember this exact key.\n"
-        tail = "\nQuestion: What is the retrieval key? Answer with only the key.\nAnswer:"
-    elif task == "variable_tracking":
-        choices = ["cerulean", "magenta", "amber", "teal"]
-        answer = choices[seed % len(choices)]
-        head = f"Initialize variables. alpha = {answer}. beta = slate. gamma = copper. Later alpha keeps its original value.\n"
-        tail = "\nQuestion: What is the final value of alpha? Answer with one word.\nAnswer:"
-    elif task == "common_words":
-        answer = "apple"
-        head = "Word multiset: apple apple apple pear pear plum. Count the words carefully.\n"
-        tail = "\nQuestion: Which word appears most often in the multiset? Answer with one word.\nAnswer:"
-    else:
-        raise ValueError(task)
-
-    filler = (
-        " Background sentence for long-context padding. It is unrelated to the answer and should be ignored."
-    )
-    return _pack_to_length(tokenizer, head, filler, tail, length), answer
+    attr = getattr(hf, "_CONFIG_ATTR", "_thriftattention_config")
+    modules = getattr(model, "modules", None)
+    for module in modules() if callable(modules) else [model]:
+        if hasattr(module, attr):
+            setattr(module, attr, config)
 
 
-def _pack_to_length(tokenizer: Any, head: str, filler: str, tail: str, length: int) -> list[int]:
-    head_ids = tokenizer(head, add_special_tokens=False)["input_ids"]
-    tail_ids = tokenizer(tail, add_special_tokens=False)["input_ids"]
-    filler_ids = tokenizer(filler, add_special_tokens=False)["input_ids"] or [tokenizer.eos_token_id or 0]
-    budget = max(0, length - len(head_ids) - len(tail_ids))
-    middle = (filler_ids * ((budget // len(filler_ids)) + 1))[:budget]
-    ids = head_ids + middle + tail_ids
-    if len(ids) > length:
-        ids = ids[: max(0, length - len(tail_ids))] + tail_ids
-    return ids
+def nvfp4_top_k_for_prompt(config: Any, prompt_len: int) -> Any:
+    if config is None or getattr(config, "mode", None) != "thrift" or getattr(config, "top_k", None) is not None:
+        return config
+    from thriftattention.selection import resolve_top_k
+
+    blocks = max(prompt_len // 64, 1)
+    top_k = resolve_top_k(blocks, causal=True, fraction=config.fp16_fraction)
+    return replace(config, top_k=top_k)
 
 
-def generate_answer(model: Any, tokenizer: Any, input_ids: list[int], args: argparse.Namespace) -> str:
+def load_ruler_modules(ruler_dir: Path) -> tuple[Any, Any]:
+    if not (ruler_dir / "ruler_gen.py").exists() or not (ruler_dir / "ruler_score.py").exists():
+        raise SystemExit(f"Could not find ruler_gen.py and ruler_score.py in {ruler_dir}")
+    sys.path.insert(0, str(ruler_dir))
+    import ruler_gen
+    import ruler_score
+
+    return ruler_gen, ruler_score
+
+
+def normalise_tasks(tasks: list[str], ruler_gen: Any) -> list[str]:
+    out = [TASK_ALIASES.get(task, task) for task in tasks]
+    valid = set(getattr(ruler_gen, "TASK_NAMES", getattr(ruler_gen, "TASK_SPECS", {}).keys()))
+    unknown = sorted(set(out) - valid)
+    if unknown:
+        raise SystemExit(f"unknown RULER task(s): {', '.join(unknown)}")
+    return out
+
+
+def generate_timed(model: Any, tokenizer: Any, sample: dict[str, Any], cache_config: Any | None, args: argparse.Namespace) -> dict[str, Any]:
+    import time
     import torch
 
-    encoded = torch.tensor([input_ids], dtype=torch.long, device=args.device)
-    with torch.inference_mode():
-        output = model.generate(
-            input_ids=encoded,
-            max_new_tokens=args.max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-    generated = output[0, encoded.shape[1] :]
-    return tokenizer.decode(generated, skip_special_tokens=True).strip()
+    prompt = sample["input"] + sample["answer_prefix"]
+    input_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    max_new_tokens = int(args.max_new_tokens or sample["max_gen"])
+    prompt_len = len(input_ids)
+    pad = (-prompt_len) % 64 if cache_config is not None else 0
+    encoded = torch.tensor([input_ids + [0] * pad], dtype=torch.long, device=args.device)
+    cache_position = torch.arange(encoded.shape[1], device=args.device, dtype=torch.long)
+    past = None
+    cache_ctx = nullcontext()
+    active_config = nvfp4_top_k_for_prompt(cache_config, prompt_len)
+    if active_config is not cache_config:
+        set_model_attention_config(model, active_config)
+    if cache_config is not None:
+        from thriftattention.integrations.transformers_cache import ThriftAttentionCache, use_thriftattention_cache
+
+        past = ThriftAttentionCache.from_model(model, config=active_config, max_cache_len=encoded.shape[1] + max_new_tokens)
+        past.prefill_real_seq_len = prompt_len
+        cache_ctx = use_thriftattention_cache(past)
+
+    generated: list[int] = []
+    with torch.inference_mode(), cache_ctx:
+        sync_cuda(args.device)
+        start = time.perf_counter()
+        out = model(input_ids=encoded, use_cache=True, past_key_values=past, cache_position=cache_position)
+        sync_cuda(args.device)
+        prefill_s = time.perf_counter() - start
+
+        past = out.past_key_values
+        if pad:
+            _crop_cache(past, prompt_len)
+        next_token = out.logits[:, prompt_len - 1, :].argmax(dim=-1)
+
+        sync_cuda(args.device)
+        start = time.perf_counter()
+        for step in range(max_new_tokens):
+            token = int(next_token.item())
+            generated.append(token)
+            if token == tokenizer.eos_token_id or step == max_new_tokens - 1:
+                break
+            cache_position = torch.tensor([prompt_len + step], device=args.device, dtype=torch.long)
+            out = model(input_ids=next_token[:, None], use_cache=True, past_key_values=past, cache_position=cache_position)
+            past = out.past_key_values
+            next_token = out.logits[:, -1, :].argmax(dim=-1)
+        sync_cuda(args.device)
+        decode_s = time.perf_counter() - start
+
+    text = tokenizer.decode(generated, skip_special_tokens=True).strip()
+    decode_steps = max(0, len(generated) - 1)
+    return {
+        "prediction": text,
+        "prompt_tokens": prompt_len,
+        "generated_tokens": len(generated),
+        "decode_steps": decode_steps,
+        "prefill_s": prefill_s,
+        "decode_s": decode_s,
+        "total_s": prefill_s + decode_s,
+        "decode_tok_s": decode_steps / decode_s if decode_s > 0 else None,
+        "e2e_tok_s": (prompt_len + len(generated)) / (prefill_s + decode_s),
+    }
+
+
+def _crop_cache(cache: Any, seq_len: int) -> None:
+    crop = getattr(cache, "crop", None)
+    if callable(crop):
+        crop(seq_len)
+    layers = getattr(cache, "layers", None)
+    if not layers:
+        return
+    for layer in layers:
+        k_fp16 = getattr(layer, "k_fp16", None)
+        v_fp16 = getattr(layer, "v_fp16", None)
+        if k_fp16 is None or v_fp16 is None:
+            continue
+        key_end = max(64, ((seq_len + 63) // 64) * 64)
+        value_end = ((key_end + 127) // 128) * 128
+        key_end = min(key_end, k_fp16.shape[2])
+        value_end = min(value_end, v_fp16.shape[2])
+        if seq_len < key_end:
+            k_fp16[:, :, seq_len:key_end].zero_()
+            quantize_k = getattr(layer, "_quantize_k_range", None)
+            if callable(quantize_k):
+                quantize_k(k_fp16[:, :, seq_len:key_end].contiguous(), seq_len, key_end)
+        if seq_len < value_end:
+            v_fp16[:, :, seq_len:value_end].zero_()
+            quantize_v = getattr(layer, "_quantize_v_range", None)
+            if callable(quantize_v):
+                quantize_v(seq_len, value_end)
 
 
 def main() -> None:
-    args = resolve_args(parse_args())
-    require_transformers()
+    args = parse_args()
+    args.lengths = parse_int_list(args.lengths)
+    args.tasks = parse_str_list(args.tasks)
+    if args.num_examples < 1:
+        raise SystemExit("--num-examples must be at least 1")
+    try:
+        __import__("transformers")
+    except Exception:
+        raise SystemExit("Missing Transformers. Run `pip install -r examples/long_context_quality/requirements.txt`.")
+    ruler_gen, ruler_score = load_ruler_modules(args.ruler_dir)
+    args.tasks = normalise_tasks(args.tasks, ruler_gen)
+
     set_seed(args.seed)
-    output_dir = make_output_dir(args.output, prefix="ruler-mini")
-    write_json(output_dir / "environment.json", collect_environment(args))
+    out_dir = make_output_dir(args.output, prefix="ruler-mini") if args.output is not None else None
+    if out_dir is not None:
+        write_json(out_dir / "environment.json", collect_environment(args))
 
-    print(f"Writing results to {output_dir}")
-    model, tokenizer = load_model_and_tokenizer(args)
-    thrift_ready, thrift_note = thrift_acceleration_status(args.device)
-    if not thrift_ready:
-        print(f"Accelerated methods will be skipped if requested: {thrift_note}")
-
+    model, tokenizer = load_model(args.model, args.device)
     rows: list[dict[str, Any]] = []
-    for method in args.methods:
-        ok, note = configure_method(model, method, args, thrift_ready, thrift_note)
-        print(f"\nMethod {method}: {note}")
+
+    for run in method_runs(args.methods, args.fractions):
+        ok, note, cache_config = configure(model, run["method"], run["fraction"], args.device)
+        print(f"\n{run['label']}: {note}")
         if not ok:
-            for length in args.lengths:
-                for task in args.tasks:
-                    rows.append({"method": method, "length": length, "task": task, "status": "skipped", "accuracy": None, "error": note})
+            rows.extend({**run, "length": length, "task": task, "status": "skipped", "error": note} for length in args.lengths for task in args.tasks)
             continue
         for length in args.lengths:
             for task in args.tasks:
-                correct: list[float] = []
-                elapsed_s: list[float] = []
-                for index in range(args.num_examples):
-                    input_ids, expected = build_task_input(tokenizer, task, length, args.seed + index + length)
-
-                    def run_one() -> str:
-                        return generate_answer(model, tokenizer, input_ids, args)
-
+                samples = ruler_gen.generate_samples(
+                    tokenizer=tokenizer,
+                    task=task,
+                    target_length=length,
+                    num_samples=args.num_examples,
+                    seed=args.seed,
+                    cache_dir=args.cache_dir,
+                )
+                for index, sample in enumerate(samples):
                     try:
-                        prediction, elapsed = timed_call(run_one, device=args.device)
-                        is_correct = expected.lower() in prediction.lower()
-                        correct.append(1.0 if is_correct else 0.0)
-                        elapsed_s.append(elapsed)
+                        result = generate_timed(model, tokenizer, sample, cache_config, args)
+                        score = float(ruler_score.score_sample(task, result["prediction"], sample["outputs"]))
+                        row = {
+                            **run,
+                            **result,
+                            "length": length,
+                            "sample_length": sample.get("length"),
+                            "task": task,
+                            "example": index,
+                            "status": "ok",
+                            "outputs": sample["outputs"],
+                            "accuracy": score,
+                        }
+                        rows.append(row)
                         print(
-                            f"  {method:<11} length={length:<6} task={task:<18} "
-                            f"expected={expected!r} correct={is_correct} wall_s={elapsed:.3f}"
+                            f"  len={length:<6} task={task:<17} acc={score:.3f} "
+                            f"prefill={row['prefill_s']:.3f}s decode={row['decode_s']:.3f}s total={row['total_s']:.3f}s"
                         )
                     except RuntimeError as exc:
-                        rows.append(
-                            {
-                                "method": method,
-                                "length": length,
-                                "task": task,
-                                "example": index,
-                                "status": "error",
-                                "accuracy": None,
-                                "error": str(exc),
-                            }
-                        )
-                if correct:
-                    rows.append(
-                        {
-                            "method": method,
-                            "length": length,
-                            "task": task,
-                            "status": "ok",
-                            "accuracy": fmean(correct),
-                            "num_examples": len(correct),
-                            "mean_wall_s": fmean(elapsed_s),
-                            "fraction": args.fraction if method == "thrift" else None,
-                        }
-                    )
+                        rows.append({**run, "length": length, "task": task, "status": "error", "error": str(exc)})
+                        print(f"  len={length:<6} task={task:<17} error={exc}")
 
-    write_jsonl(output_dir / "metrics.jsonl", rows)
-    summary_rows = _summary_rows(rows)
-    summary = "\n".join(
+    summary = average_rows(rows)
+    table = markdown_table(
+        summary,
         [
-            "# RULER Mini",
-            "",
-            "Tiny synthetic generation tasks inspired by RULER. This is a smoke test, not an official RULER score.",
-            "",
-            markdown_table(summary_rows, [("method", "method"), ("length", "length"), ("accuracy", "mean accuracy"), ("status", "status")]),
-            "",
-            f"Model: `{args.model}`",
-            f"Tasks: `{', '.join(args.tasks)}`",
-        ]
+            ("tokens", "tokens"),
+            ("task", "task"),
+            ("method", "method"),
+            ("score", "avg_score"),
+            ("prefill_s", "prefill_s"),
+            ("decode_s", "decode_s"),
+            ("total_s", "total_s"),
+            ("n", "n"),
+            ("status", "status"),
+        ],
     )
-    (output_dir / "summary.md").write_text(summary + "\n", encoding="utf-8")
-    print(f"\nWrote metrics.jsonl, summary.md, and environment.json under {output_dir}")
+    print("\nAverage scores")
+    print(table)
+
+    if out_dir is not None:
+        write_jsonl(out_dir / "metrics.jsonl", rows)
+        (out_dir / "summary.md").write_text("# RULER Mini\n\n" + table + "\n", encoding="utf-8")
+        print(f"\nWrote {out_dir}")
 
 
-def _summary_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+def average_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[int, str, str], list[dict[str, Any]]] = {}
     for row in rows:
-        grouped.setdefault((str(row["method"]), int(row["length"])), []).append(row)
+        grouped.setdefault((row["length"], row["task"], row["label"]), []).append(row)
+
     summary: list[dict[str, Any]] = []
-    for (method, length), items in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1])):
-        ok = [float(item["accuracy"]) for item in items if item.get("status") == "ok" and item.get("accuracy") is not None]
-        status = "ok" if ok else items[0].get("status", "skipped")
-        summary.append({"method": method, "length": length, "accuracy": f"{fmean(ok):.3f}" if ok else "-", "status": status})
+    for (length, task, label), items in sorted(grouped.items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
+        ok = [item for item in items if item.get("status") == "ok"]
+        summary.append(
+            {
+                "tokens": length,
+                "task": task,
+                "method": label,
+                "score": f"{fmean(item['accuracy'] for item in ok):.3f}" if ok else "-",
+                "prefill_s": f"{fmean(item['prefill_s'] for item in ok):.3f}" if ok else "-",
+                "decode_s": f"{fmean(item['decode_s'] for item in ok):.3f}" if ok else "-",
+                "total_s": f"{fmean(item['total_s'] for item in ok):.3f}" if ok else "-",
+                "n": len(ok),
+                "status": "ok" if ok else items[0].get("status", "skipped"),
+            }
+        )
     return summary
 
 

@@ -1,5 +1,10 @@
 [build-system]
-requires = ["setuptools>=68", "wheel", "torch"]
+# PyTorch is intentionally not listed here. A CUDA extension must build
+# against the PyTorch wheel installed in the target environment; otherwise
+# pip build isolation may install a temporary torch wheel whose CUDA version
+# does not match the local CUDA toolkit. Install torch first, then run pip
+# with --no-build-isolation.
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]

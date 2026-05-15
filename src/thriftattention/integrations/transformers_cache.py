@@ -75,6 +75,10 @@ class ThriftAttentionCacheLayer:
     v_packed_t: torch.Tensor | None = None
     v_scale_t: torch.Tensor | None = None
     k_mean: torch.Tensor | None = None
+    selected_blocks: torch.Tensor | None = None
+    selection_local_scores: torch.Tensor | None = None
+    selection_local_indices: torch.Tensor | None = None
+    selection_done_counts: torch.Tensor | None = None
     seq_len: int = 0
     capacity: int = 0
 
@@ -168,6 +172,21 @@ class ThriftAttentionCacheLayer:
             raise RuntimeError("ThriftAttention K block means have not been initialized")
 
         ext = get_extension()
+        if complete_blocks <= 2048 and hasattr(ext, "single_query_key_mean_topk_into"):
+            topk, local_scores, local_indices, done_counts = self._ensure_selection_workspace(
+                q_grouped,
+                complete_blocks,
+                selected_count,
+            )
+            return ext.single_query_key_mean_topk_into(
+                q_grouped,
+                self.k_mean,
+                topk,
+                local_scores,
+                local_indices,
+                done_counts,
+                complete_blocks,
+            )
         if complete_blocks <= 2048 and hasattr(ext, "single_query_key_mean_topk"):
             return ext.single_query_key_mean_topk(
                 q_grouped,
@@ -293,6 +312,68 @@ class ThriftAttentionCacheLayer:
             .to(torch.float16)
         )
 
+    def _ensure_selection_workspace(
+        self,
+        q_grouped: torch.Tensor,
+        complete_blocks: int,
+        selected_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, kv_heads, _, _ = q_grouped.shape
+        flat_heads = batch * kv_heads
+        chunk_count = _round_up(complete_blocks, 64) // 64
+        local_count = min(selected_count, 64)
+        topk_shape = (flat_heads, selected_count)
+        local_shape = (flat_heads, chunk_count, local_count)
+        done_shape = (flat_heads,)
+
+        if (
+            self.selected_blocks is None
+            or tuple(self.selected_blocks.shape) != topk_shape
+            or self.selected_blocks.device != q_grouped.device
+        ):
+            self.selected_blocks = torch.empty(
+                topk_shape,
+                device=q_grouped.device,
+                dtype=torch.int32,
+            )
+        if (
+            self.selection_local_scores is None
+            or tuple(self.selection_local_scores.shape) != local_shape
+            or self.selection_local_scores.device != q_grouped.device
+        ):
+            self.selection_local_scores = torch.empty(
+                local_shape,
+                device=q_grouped.device,
+                dtype=torch.float32,
+            )
+        if (
+            self.selection_local_indices is None
+            or tuple(self.selection_local_indices.shape) != local_shape
+            or self.selection_local_indices.device != q_grouped.device
+        ):
+            self.selection_local_indices = torch.empty(
+                local_shape,
+                device=q_grouped.device,
+                dtype=torch.int32,
+            )
+        if (
+            self.selection_done_counts is None
+            or tuple(self.selection_done_counts.shape) != done_shape
+            or self.selection_done_counts.device != q_grouped.device
+        ):
+            self.selection_done_counts = torch.empty(
+                done_shape,
+                device=q_grouped.device,
+                dtype=torch.int32,
+            )
+
+        return (
+            self.selected_blocks,
+            self.selection_local_scores,
+            self.selection_local_indices,
+            self.selection_done_counts,
+        )
+
     def _index_select_batch(self, indices: torch.Tensor) -> None:
         for name in self._tensor_names():
             tensor = getattr(self, name)
@@ -328,6 +409,7 @@ class ThriftAttentionCache:
         self._max_cache_len = max_cache_len
         self.layers: list[ThriftAttentionCacheLayer] = []
         self._seen_tokens = 0
+        self.prefill_real_seq_len: int | None = None
 
     @classmethod
     def from_model(
@@ -506,9 +588,11 @@ def cached_prefill_attention(
 ) -> torch.Tensor:
     layer = cache.layer(layer_idx)
     q = query.contiguous()
+    k_fp16 = layer.key_view().contiguous()
+    v_fp16 = layer.value_view().contiguous()
     q_packed, q_scale = nvfp4_quantize(q)
-    _, v_packed_t, _, v_scale_t = layer.packed_views()
-    k_packed, k_scale = nvfp4_quantize_permuted(layer.key_view().contiguous())
+    k_packed, k_scale = nvfp4_quantize_permuted(k_fp16)
+    v_packed_t, v_scale_t = nvfp4_quantize_transposed(v_fp16)
     ext = get_extension()
 
     if config.mode == "fp4":
@@ -522,7 +606,12 @@ def cached_prefill_attention(
     if config.mode != "thrift":
         raise ValueError(f"unsupported ThriftAttention mode {config.mode!r}")
 
-    selected_blocks = _select_block_pairs_from_cached_means(q, layer, config)
+    selected_blocks = _select_block_pairs_from_cached_means(
+        q,
+        layer,
+        config,
+        real_q_len=cache.prefill_real_seq_len,
+    )
     fn = (
         ext.thrift_attention_causal_nvfp4_packed
         if config.causal
@@ -530,8 +619,8 @@ def cached_prefill_attention(
     )
     return fn(
         q,
-        layer.key_view(),
-        layer.value_view(),
+        k_fp16,
+        v_fp16,
         selected_blocks,
         q_packed,
         k_packed,
@@ -546,6 +635,7 @@ def _select_block_pairs_from_cached_means(
     q: torch.Tensor,
     layer: ThriftAttentionCacheLayer,
     config: AttentionConfig,
+    real_q_len: int | None = None,
 ) -> torch.Tensor:
     if layer.k_mean is None:
         raise RuntimeError("ThriftAttention K block means have not been initialized")
@@ -569,13 +659,31 @@ def _select_block_pairs_from_cached_means(
             dtype=torch.int32,
         )
 
-    q_mean = (
-        q.reshape(batch, q_heads, num_q_blocks, block_size, head_dim)
-        .float()
-        .mean(dim=3)
-        .to(torch.float16)
-        .contiguous()
-    )
+    if real_q_len is None or real_q_len >= q_len:
+        q_mean = (
+            q.reshape(batch, q_heads, num_q_blocks, block_size, head_dim)
+            .float()
+            .mean(dim=3)
+            .to(torch.float16)
+            .contiguous()
+        )
+    else:
+        real_q_len = max(0, int(real_q_len))
+        q_blocks = q.reshape(batch, q_heads, num_q_blocks, block_size, head_dim).float()
+        counts = torch.full((num_q_blocks,), block_size, device=q.device, dtype=torch.float32)
+        full_blocks = real_q_len // block_size
+        tail = real_q_len % block_size
+        if full_blocks < num_q_blocks:
+            counts[full_blocks:] = 0
+            if tail:
+                counts[full_blocks] = tail
+                q_blocks[:, :, full_blocks, tail:] = 0
+                q_blocks[:, :, full_blocks + 1 :] = 0
+            else:
+                q_blocks[:, :, full_blocks:] = 0
+        q_mean = (
+            q_blocks.sum(dim=3) / counts.clamp_min(1).view(1, 1, -1, 1)
+        ).to(torch.float16).contiguous()
     k_mean = layer.k_mean[:, :, :num_kv_blocks]
     if q_heads != kv_heads:
         k_mean = k_mean.repeat_interleave(q_heads // kv_heads, dim=1).contiguous()

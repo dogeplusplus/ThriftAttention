@@ -2,7 +2,18 @@ from pathlib import Path
 import os
 
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+try:
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+except ModuleNotFoundError as exc:
+    if exc.name != "torch":
+        raise
+    raise RuntimeError(
+        "ThriftAttention builds against the PyTorch wheel installed in the "
+        "target environment. Install a PyTorch CUDA wheel that matches your "
+        "local CUDA toolkit, then run `python -m pip install -e . "
+        "--no-build-isolation`."
+    ) from exc
 
 
 ROOT = Path(__file__).parent

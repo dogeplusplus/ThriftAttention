@@ -1235,11 +1235,8 @@ void thrift_attention_single_query_split_kernel(
     const int kv_bid = batch_id * num_kv_heads + kv_head;
 
     const int total_kv_blocks = cdiv_sqmix(kv_len, BLOCK_KV_FP4);
-    const int blocks_per_split = cdiv_sqmix(total_kv_blocks, num_kv_splits);
-    const int kv_block_start = split_id * blocks_per_split;
-    const int kv_block_end = min(kv_block_start + blocks_per_split, total_kv_blocks);
-
-    if (kv_block_start >= total_kv_blocks) return;
+    const int kv_block_start = (split_id * total_kv_blocks) / num_kv_splits;
+    const int kv_block_end = ((split_id + 1) * total_kv_blocks) / num_kv_splits;
 
     Q   += bid * q_len       * HEAD_DIM_2;
     K   += kv_bid * kv_capacity * HEAD_DIM_2;

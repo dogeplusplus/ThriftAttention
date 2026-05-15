@@ -5,12 +5,15 @@ csrc/bindings.cpp
 csrc/cuda/sm120/nvfp4/block_selection.cu
 csrc/cuda/sm120/nvfp4/fp4_attention.cu
 csrc/cuda/sm120/nvfp4/quantization.cu
+csrc/cuda/sm120/nvfp4/single_query_attention.cu
+csrc/cuda/sm120/nvfp4/single_query_fp4_attention.cu
 csrc/cuda/sm120/nvfp4/thrift_attention.cu
 src/thriftattention/__init__.py
 src/thriftattention/_checks.py
 src/thriftattention/_extension.py
 src/thriftattention/config.py
 src/thriftattention/functional.py
+src/thriftattention/patch.py
 src/thriftattention/quantization.py
 src/thriftattention/selection.py
 src/thriftattention.egg-info/PKG-INFO
@@ -18,5 +21,10 @@ src/thriftattention.egg-info/SOURCES.txt
 src/thriftattention.egg-info/dependency_links.txt
 src/thriftattention.egg-info/requires.txt
 src/thriftattention.egg-info/top_level.txt
+src/thriftattention/integrations/__init__.py
+src/thriftattention/integrations/transformers.py
+src/thriftattention/integrations/transformers_cache.py
+tests/test_functional.py
 tests/test_import.py
+tests/test_patch.py
 tests/test_selection.py

@@ -130,6 +130,21 @@ void single_query_key_mean_topk(
     int k_mean_capacity_blocks,
     int head_dim,
     int topk_count);
+void single_query_key_mean_topk_chunked(
+    const void* q_grouped,
+    const void* k_mean,
+    void* topk_out,
+    void* local_scores,
+    void* local_indices,
+    void* done_counts,
+    int flat_heads,
+    int groups,
+    int num_kv_blocks,
+    int k_mean_capacity_blocks,
+    int head_dim,
+    int topk_count,
+    int chunk_count,
+    int local_count);
 void pack_topk_mask(
     const int32_t* topk,
     void* topk_mask,
@@ -641,10 +656,113 @@ static at::Tensor single_query_key_mean_topk_impl(
         return topk;
     }
 
-    single_query_key_mean_topk(
+    if (num_kv_blocks <= 128) {
+        single_query_key_mean_topk(
+            q_grouped.data_ptr(), k_mean.data_ptr(), topk.data_ptr(),
+            flat_heads, groups, num_kv_blocks, k_mean_capacity_blocks,
+            head_dim, topk_count);
+        return topk;
+    }
+
+    constexpr int chunk_blocks = 64;
+    const int chunk_count = (num_kv_blocks + chunk_blocks - 1) / chunk_blocks;
+    const int local_count = std::min(topk_count, chunk_blocks);
+    at::Tensor local_scores = at::empty(
+        {flat_heads, chunk_count, local_count},
+        at::TensorOptions().dtype(at::kFloat).device(q_grouped.device()));
+    at::Tensor local_indices = at::empty({flat_heads, chunk_count, local_count}, opts);
+    at::Tensor done_counts = at::empty({flat_heads}, opts);
+    done_counts.zero_();
+    single_query_key_mean_topk_chunked(
         q_grouped.data_ptr(), k_mean.data_ptr(), topk.data_ptr(),
+        local_scores.data_ptr(), local_indices.data_ptr(), done_counts.data_ptr(),
         flat_heads, groups, num_kv_blocks, k_mean_capacity_blocks,
-        head_dim, topk_count);
+        head_dim, topk_count, chunk_count, local_count);
+
+    return topk;
+}
+
+static at::Tensor single_query_key_mean_topk_into_impl(
+    const at::Tensor& q_grouped,
+    const at::Tensor& k_mean,
+    at::Tensor& topk,
+    at::Tensor& local_scores,
+    at::Tensor& local_indices,
+    at::Tensor& done_counts,
+    int num_kv_blocks) {
+    TORCH_CHECK(q_grouped.is_cuda() && k_mean.is_cuda(),
+                "q_grouped and k_mean must be CUDA tensors");
+    TORCH_CHECK(topk.is_cuda() && local_scores.is_cuda() &&
+                local_indices.is_cuda() && done_counts.is_cuda(),
+                "top-k workspace tensors must be CUDA tensors");
+    TORCH_CHECK(q_grouped.is_contiguous() && k_mean.is_contiguous() &&
+                topk.is_contiguous() && local_scores.is_contiguous() &&
+                local_indices.is_contiguous() && done_counts.is_contiguous(),
+                "q_grouped, k_mean, and top-k workspace tensors must be contiguous");
+    TORCH_CHECK(q_grouped.dtype() == at::kHalf && k_mean.dtype() == at::kHalf,
+                "q_grouped and k_mean must be float16");
+    TORCH_CHECK(topk.dtype() == at::kInt && local_indices.dtype() == at::kInt &&
+                done_counts.dtype() == at::kInt,
+                "topk, local_indices, and done_counts must be int32");
+    TORCH_CHECK(local_scores.dtype() == at::kFloat,
+                "local_scores must be float32");
+    TORCH_CHECK(q_grouped.dim() == 4 && k_mean.dim() == 4,
+                "q_grouped and k_mean must be 4D tensors");
+    TORCH_CHECK(q_grouped.size(0) == k_mean.size(0),
+                "q_grouped and k_mean batch dimensions must match");
+    TORCH_CHECK(q_grouped.size(1) == k_mean.size(1),
+                "q_grouped and k_mean KV-head dimensions must match");
+    TORCH_CHECK(q_grouped.size(3) == k_mean.size(3),
+                "q_grouped and k_mean head_dim must match");
+
+    const int batch = q_grouped.size(0);
+    const int kv_heads = q_grouped.size(1);
+    const int flat_heads = batch * kv_heads;
+    const int groups = q_grouped.size(2);
+    const int head_dim = q_grouped.size(3);
+    const int k_mean_capacity_blocks = k_mean.size(2);
+    const int topk_count = topk.size(1);
+    TORCH_CHECK(topk.dim() == 2 && topk.size(0) == flat_heads,
+                "topk must be shaped [batch * kv_heads, topk_count]");
+    TORCH_CHECK(done_counts.dim() == 1 && done_counts.size(0) == flat_heads,
+                "done_counts must be shaped [batch * kv_heads]");
+    TORCH_CHECK(groups >= 1 && groups <= 16,
+                "grouped single-query selector expects groups in [1, 16], got ", groups);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128,
+                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(num_kv_blocks >= 0 && num_kv_blocks <= k_mean_capacity_blocks,
+                "num_kv_blocks must be in [0, k_mean capacity]");
+    TORCH_CHECK(num_kv_blocks <= 2048,
+                "single-query block selector supports <= 2048 KV blocks, got ", num_kv_blocks);
+    TORCH_CHECK(topk_count >= 0 && topk_count <= num_kv_blocks,
+                "topk_count must be in [0, num_kv_blocks]");
+    if (topk_count == 0) {
+        return topk;
+    }
+    done_counts.zero_();
+
+    if (num_kv_blocks <= 128) {
+        single_query_key_mean_topk(
+            q_grouped.data_ptr(), k_mean.data_ptr(), topk.data_ptr(),
+            flat_heads, groups, num_kv_blocks, k_mean_capacity_blocks,
+            head_dim, topk_count);
+        return topk;
+    }
+
+    constexpr int chunk_blocks = 64;
+    const int chunk_count = (num_kv_blocks + chunk_blocks - 1) / chunk_blocks;
+    const int local_count = std::min(topk_count, chunk_blocks);
+    TORCH_CHECK(local_scores.dim() == 3 && local_scores.size(0) == flat_heads &&
+                local_scores.size(1) >= chunk_count && local_scores.size(2) >= local_count,
+                "local_scores workspace is too small");
+    TORCH_CHECK(local_indices.dim() == 3 && local_indices.size(0) == flat_heads &&
+                local_indices.size(1) >= chunk_count && local_indices.size(2) >= local_count,
+                "local_indices workspace is too small");
+    single_query_key_mean_topk_chunked(
+        q_grouped.data_ptr(), k_mean.data_ptr(), topk.data_ptr(),
+        local_scores.data_ptr(), local_indices.data_ptr(), done_counts.data_ptr(),
+        flat_heads, groups, num_kv_blocks, k_mean_capacity_blocks,
+        head_dim, topk_count, chunk_count, local_count);
 
     return topk;
 }
@@ -682,4 +800,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("topk_count"),
           pybind11::arg("num_kv_blocks"),
           "Select decode KV blocks using grouped single-query block-mean QK scores");
+    m.def("single_query_key_mean_topk_into", &single_query_key_mean_topk_into_impl,
+          pybind11::arg("q_grouped"),
+          pybind11::arg("k_mean"),
+          pybind11::arg("topk"),
+          pybind11::arg("local_scores"),
+          pybind11::arg("local_indices"),
+          pybind11::arg("done_counts"),
+          pybind11::arg("num_kv_blocks"),
+          "Select decode KV blocks into preallocated top-k workspace");
 }

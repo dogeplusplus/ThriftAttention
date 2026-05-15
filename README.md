@@ -13,15 +13,23 @@ The fused quantize-and-mean experiment is intentionally not part of this library
 
 ## Install
 
+Install a PyTorch CUDA wheel that matches the local CUDA toolkit before
+building ThriftAttention. For CUDA 12.8:
+
 ```bash
-pip install -e .
+python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -e . --no-build-isolation
 ```
 
 Install the optional Hugging Face Transformers integration with:
 
 ```bash
-pip install -e ".[hf]"
+python -m pip install -e ".[hf]" --no-build-isolation
 ```
+
+For other CUDA versions, choose the matching PyTorch CUDA wheel first. The
+editable install uses `--no-build-isolation` so the CUDA extension compiles
+against that already-installed PyTorch instead of a temporary build-env wheel.
 
 The current CUDA extension targets SM120 (`TORCH_CUDA_ARCH_LIST=12.0a`).
 

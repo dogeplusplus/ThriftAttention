@@ -5,6 +5,8 @@ Summary: Selective mixed-precision attention kernels for long-context FP4 infere
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
 Requires-Dist: torch
+Provides-Extra: hf
+Requires-Dist: transformers>=4.52; extra == "hf"
 
 # ThriftAttention
 
@@ -25,6 +27,12 @@ The fused quantize-and-mean experiment is intentionally not part of this library
 pip install -e .
 ```
 
+Install the optional Hugging Face Transformers integration with:
+
+```bash
+pip install -e ".[hf]"
+```
+
 The current CUDA extension targets SM120 (`TORCH_CUDA_ARCH_LIST=12.0a`).
 
 ## API Sketch
@@ -34,7 +42,7 @@ import thriftattention as ta
 
 out = ta.attention(q, k, v, top_k=4)
 baseline = ta.fp4_attention(q, k, v)
-selected = ta.select_blocks(q, k, top_k=4)
+selected = ta.select_block_pairs(q, k, top_k=4)
 ```
 
 Inputs are `torch.float16` CUDA tensors shaped `[batch, heads, seq, head_dim]`.

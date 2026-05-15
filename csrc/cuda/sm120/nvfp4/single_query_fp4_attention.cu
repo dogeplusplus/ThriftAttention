@@ -206,11 +206,8 @@ void fp4_attention_single_query_kernel(
 
     // Compute KV range for this split
     const int total_kv_blocks = cdiv_sqfp4(kv_len, BLOCK_KV);
-    const int blocks_per_split = cdiv_sqfp4(total_kv_blocks, num_kv_splits);
-    const int kv_block_start = split_id * blocks_per_split;
-    const int kv_block_end = min(kv_block_start + blocks_per_split, total_kv_blocks);
-
-    if (kv_block_start >= total_kv_blocks) return;
+    const int kv_block_start = (split_id * total_kv_blocks) / num_kv_splits;
+    const int kv_block_end = ((split_id + 1) * total_kv_blocks) / num_kv_splits;
 
     Q   += bid * q_len       * HEAD_DIM_2;
     K   += kv_bid * kv_capacity * HEAD_DIM_2 + kv_block_start * BLOCK_KV * HEAD_DIM_2;
@@ -407,8 +404,6 @@ void fp4_attention_single_query_kernel(
                 S_rmem[mma_id_kv][reg_id] *= softmax_scale;
 
         float this_rowmax[2] = {-FLT_MAX, -FLT_MAX};
-        float p_group_max_upper[BLOCK_KV / MMA_N / 2];
-        float p_group_max_lower[BLOCK_KV / MMA_N / 2];
         for (int blk = 0; blk < BLOCK_KV / MMA_N / 2; blk++) {
             const int t0 = 2 * blk;
             const int t1 = t0 + 1;
@@ -424,8 +419,6 @@ void fp4_attention_single_query_kernel(
             gmax_upper = max(gmax_upper, __shfl_xor_sync(0xFFFFFFFF, gmax_upper, 2));
             gmax_lower = max(gmax_lower, __shfl_xor_sync(0xFFFFFFFF, gmax_lower, 1));
             gmax_lower = max(gmax_lower, __shfl_xor_sync(0xFFFFFFFF, gmax_lower, 2));
-            p_group_max_upper[blk] = gmax_upper;
-            p_group_max_lower[blk] = gmax_lower;
             this_rowmax[0] = max(this_rowmax[0], gmax_upper);
             this_rowmax[1] = max(this_rowmax[1], gmax_lower);
         }
@@ -466,23 +459,42 @@ void fp4_attention_single_query_kernel(
         rowsum[0] = rowsum[0] * rescale[0] + this_rowsumexp[0];
         rowsum[1] = rowsum[1] * rescale[1] + this_rowsumexp[1];
 
-        // ---- quantise S -> FP4 for P@V ----
         constexpr float FP4_RANGE = 448.0f * 6.0f;
         constexpr float FP4_MAX = 6.0f;
+
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+            S_rmem[mma_id_kv][0] *= FP4_RANGE;
+            S_rmem[mma_id_kv][1] *= FP4_RANGE;
+            S_rmem[mma_id_kv][2] *= FP4_RANGE;
+            S_rmem[mma_id_kv][3] *= FP4_RANGE;
+        }
+
         float sf_P_upper[BLOCK_KV / MMA_N / 2];
         float sf_P_lower[BLOCK_KV / MMA_N / 2];
 
         for (int blk = 0; blk < BLOCK_KV / MMA_N / 2; blk++) {
             int t0 = 2 * blk;
             int t1 = t0 + 1;
-            const float gmax_upper = p_group_max_upper[blk];
-            const float gmax_lower = p_group_max_lower[blk];
-            const bool valid_upper = gmax_upper > -FLT_MAX * 0.5f;
-            const bool valid_lower = gmax_lower > -FLT_MAX * 0.5f;
-            float inv_upper = valid_upper ? (FP4_MAX * __expf(rowmax[0] - gmax_upper)) : 0.0f;
-            float inv_lower = valid_lower ? (FP4_MAX * __expf(rowmax[1] - gmax_lower)) : 0.0f;
-            sf_P_upper[blk] = valid_upper ? (FP4_RANGE / FP4_MAX * __expf(gmax_upper - rowmax[0])) : 1.0f;
-            sf_P_lower[blk] = valid_lower ? (FP4_RANGE / FP4_MAX * __expf(gmax_lower - rowmax[1])) : 1.0f;
+
+            float amax_upper = max(
+                max(S_rmem[t0][0], S_rmem[t0][1]),
+                max(S_rmem[t1][0], S_rmem[t1][1])
+            );
+            amax_upper = max(amax_upper, __shfl_xor_sync(0xFFFFFFFF, amax_upper, 1));
+            amax_upper = max(amax_upper, __shfl_xor_sync(0xFFFFFFFF, amax_upper, 2));
+
+            float amax_lower = max(
+                max(S_rmem[t0][2], S_rmem[t0][3]),
+                max(S_rmem[t1][2], S_rmem[t1][3])
+            );
+            amax_lower = max(amax_lower, __shfl_xor_sync(0xFFFFFFFF, amax_lower, 1));
+            amax_lower = max(amax_lower, __shfl_xor_sync(0xFFFFFFFF, amax_lower, 2));
+
+            sf_P_upper[blk] = amax_upper / FP4_MAX;
+            sf_P_lower[blk] = amax_lower / FP4_MAX;
+
+            float inv_upper = 1.0f / sf_P_upper[blk];
+            float inv_lower = 1.0f / sf_P_lower[blk];
 
             S_rmem[t0][0] *= inv_upper;
             S_rmem[t0][1] *= inv_upper;
@@ -886,8 +898,6 @@ void fp4_attention_single_query_nosplit_kernel(
                 S_rmem[mma_id_kv][reg_id] *= softmax_scale;
 
         float this_rowmax[2] = {-FLT_MAX, -FLT_MAX};
-        float p_group_max_upper[BLOCK_KV / MMA_N / 2];
-        float p_group_max_lower[BLOCK_KV / MMA_N / 2];
         for (int blk = 0; blk < BLOCK_KV / MMA_N / 2; blk++) {
             const int t0 = 2 * blk;
             const int t1 = t0 + 1;
@@ -903,8 +913,6 @@ void fp4_attention_single_query_nosplit_kernel(
             gmax_upper = max(gmax_upper, __shfl_xor_sync(0xFFFFFFFF, gmax_upper, 2));
             gmax_lower = max(gmax_lower, __shfl_xor_sync(0xFFFFFFFF, gmax_lower, 1));
             gmax_lower = max(gmax_lower, __shfl_xor_sync(0xFFFFFFFF, gmax_lower, 2));
-            p_group_max_upper[blk] = gmax_upper;
-            p_group_max_lower[blk] = gmax_lower;
             this_rowmax[0] = max(this_rowmax[0], gmax_upper);
             this_rowmax[1] = max(this_rowmax[1], gmax_lower);
         }
@@ -1371,23 +1379,42 @@ void fp4_attention_single_query_cta_kernel(
         rowsum[0] = rowsum[0] * rescale[0] + this_rowsumexp[0];
         rowsum[1] = rowsum[1] * rescale[1] + this_rowsumexp[1];
 
-        // ---- quantise S -> FP4 for P@V ----
         constexpr float FP4_RANGE = 448.0f * 6.0f;
         constexpr float FP4_MAX = 6.0f;
+
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+            S_rmem[mma_id_kv][0] *= FP4_RANGE;
+            S_rmem[mma_id_kv][1] *= FP4_RANGE;
+            S_rmem[mma_id_kv][2] *= FP4_RANGE;
+            S_rmem[mma_id_kv][3] *= FP4_RANGE;
+        }
+
         float sf_P_upper[BLOCK_KV / MMA_N / 2];
         float sf_P_lower[BLOCK_KV / MMA_N / 2];
 
         for (int blk = 0; blk < BLOCK_KV / MMA_N / 2; blk++) {
             int t0 = 2 * blk;
             int t1 = t0 + 1;
-            const float gmax_upper = p_group_max_upper[blk];
-            const float gmax_lower = p_group_max_lower[blk];
-            const bool valid_upper = gmax_upper > -FLT_MAX * 0.5f;
-            const bool valid_lower = gmax_lower > -FLT_MAX * 0.5f;
-            float inv_upper = valid_upper ? (FP4_MAX * __expf(rowmax[0] - gmax_upper)) : 0.0f;
-            float inv_lower = valid_lower ? (FP4_MAX * __expf(rowmax[1] - gmax_lower)) : 0.0f;
-            sf_P_upper[blk] = valid_upper ? (FP4_RANGE / FP4_MAX * __expf(gmax_upper - rowmax[0])) : 1.0f;
-            sf_P_lower[blk] = valid_lower ? (FP4_RANGE / FP4_MAX * __expf(gmax_lower - rowmax[1])) : 1.0f;
+
+            float amax_upper = max(
+                max(S_rmem[t0][0], S_rmem[t0][1]),
+                max(S_rmem[t1][0], S_rmem[t1][1])
+            );
+            amax_upper = max(amax_upper, __shfl_xor_sync(0xFFFFFFFF, amax_upper, 1));
+            amax_upper = max(amax_upper, __shfl_xor_sync(0xFFFFFFFF, amax_upper, 2));
+
+            float amax_lower = max(
+                max(S_rmem[t0][2], S_rmem[t0][3]),
+                max(S_rmem[t1][2], S_rmem[t1][3])
+            );
+            amax_lower = max(amax_lower, __shfl_xor_sync(0xFFFFFFFF, amax_lower, 1));
+            amax_lower = max(amax_lower, __shfl_xor_sync(0xFFFFFFFF, amax_lower, 2));
+
+            sf_P_upper[blk] = amax_upper / FP4_MAX;
+            sf_P_lower[blk] = amax_lower / FP4_MAX;
+
+            float inv_upper = 1.0f / sf_P_upper[blk];
+            float inv_lower = 1.0f / sf_P_lower[blk];
 
             S_rmem[t0][0] *= inv_upper;
             S_rmem[t0][1] *= inv_upper;
@@ -1720,23 +1747,14 @@ void fp4_attention_single_query_nvfp4(
     const int total_kv_blocks = cdiv_sqfp4(kv_len, BLOCK_KV);
 
     if (total_kv_blocks <= 4) {
-        // Nosplit: 1 warp per block, kv_len <= 1024
         if (head_dim == 64)
             fp4_attention_single_query_nosplit_launch<64>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
         else
             fp4_attention_single_query_nosplit_launch<128>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
-    } else if (total_kv_blocks < 128) {
-        // CTA-cooperative: 4 warps per block, smem reduction, 256 < kv_len < 8192
+    } else {
         if (head_dim == 64)
             fp4_attention_single_query_cta_launch<64>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
         else
             fp4_attention_single_query_cta_launch<128>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
-    } else {
-        // Split-KV: multiple blocks per batch, global memory reduction
-        auto workspace = reinterpret_cast<float*>(workspace_raw);
-        if (head_dim == 64)
-            fp4_attention_single_query_split_launch<64>(Q, K, V, S_Q, S_K, S_V, O, workspace, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
-        else
-            fp4_attention_single_query_split_launch<128>(Q, K, V, S_Q, S_K, S_V, O, workspace, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
     }
 }
