@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 import torch
 
-from ..config import AttentionConfig
+from ..config import AttentionConfig, AttentionMode, FallbackBackend, SelectionMethod
 from ..functional import attention as thrift_attention
 from ..functional import fp4_attention
 from ..selection import resolve_top_k
@@ -15,72 +15,114 @@ from .transformers_cache import (
     cached_decode_attention,
     cached_prefill_attention,
     get_active_thriftattention_cache,
-    is_thriftattention_cache,
     use_thriftattention_cache,
 )
 
 
-BACKEND_NAME = "thriftattention"
-_CONFIG_ATTR = "_thriftattention_config"
-_GENERATION_CONFIG_ATTR = "_thriftattention_generation_config"
-_ORIGINAL_ATTN_IMPL_ATTR = "_thriftattention_original_attn_implementation"
-_ORIGINAL_GENERATE_ATTR = "_thriftattention_original_generate"
-_PATCHED_ATTR = "_thriftattention_patched"
+DEFAULT_TRANSFORMERS_ATTENTION_NAME = "thrift_attention"
+_REGISTERED_CONFIGS: dict[str, AttentionConfig] = {}
 
 
 @dataclass(frozen=True)
-class HFPatchHandle:
-    model: object
-    original_attn_implementation: object
-    backend_name: str = BACKEND_NAME
+class TransformersAttentionConfig:
+    name: str = DEFAULT_TRANSFORMERS_ATTENTION_NAME
+    mode: AttentionMode = "thrift"
+    causal: bool = True
+    selector: SelectionMethod = "block_mean"
+    fp16_fraction: float = 0.05
+    top_k: int | None = None
+    block_size: int = 64
+    fallback: FallbackBackend = "error"
 
-    def unpatch(self) -> object:
-        return unpatch_hf_model(self.model)
-
-
-def register_thriftattention_backend(config: AttentionConfig | None = None) -> str:
-    registry = _get_attention_registry()
-    _register_once(registry, BACKEND_NAME, thriftattention_forward)
-    _register_attention_mask()
-    return BACKEND_NAME
-
-
-def patch_hf_model(model: object, config: AttentionConfig) -> object:
-    set_attn_implementation = _attn_implementation_setter(model)
-    register_thriftattention_backend(config)
-    original = _current_attn_implementation(model)
-    if not hasattr(model, _ORIGINAL_ATTN_IMPL_ATTR):
-        setattr(model, _ORIGINAL_ATTN_IMPL_ATTR, original)
-
-    for module in _iter_modules(model):
-        setattr(module, _CONFIG_ATTR, config)
-
-    set_attn_implementation(BACKEND_NAME)
-    if config.patch_generation:
-        _patch_generate(model, config)
-    setattr(model, _PATCHED_ATTR, True)
-    return model
+    def attention_config(self) -> AttentionConfig:
+        return AttentionConfig(
+            mode=_validate_choice("mode", self.mode, ("thrift", "fp4")),
+            causal=bool(self.causal),
+            selector=_validate_choice("selector", self.selector, ("block_mean",)),
+            fp16_fraction=_validate_fraction(self.fp16_fraction),
+            top_k=_validate_top_k(self.top_k),
+            block_size=_validate_block_size(self.block_size),
+            fallback=_validate_choice("fallback", self.fallback, ("error",)),
+        )
 
 
-def unpatch_hf_model(model: object) -> object:
-    if hasattr(model, _ORIGINAL_GENERATE_ATTR):
-        setattr(model, "generate", getattr(model, _ORIGINAL_GENERATE_ATTR))
-        delattr(model, _ORIGINAL_GENERATE_ATTR)
-    if hasattr(model, _GENERATION_CONFIG_ATTR):
-        delattr(model, _GENERATION_CONFIG_ATTR)
+@dataclass(frozen=True)
+class TransformersCacheInputs:
+    input_ids: torch.Tensor
+    cache_position: torch.Tensor
+    past_key_values: ThriftAttentionCache
+    prompt_length: int
+    padded_length: int
+    padding: int
+    config: AttentionConfig
 
-    original = getattr(model, _ORIGINAL_ATTN_IMPL_ATTR, None)
-    if hasattr(model, _ORIGINAL_ATTN_IMPL_ATTR):
-        _set_attn_implementation(model, original)
-        delattr(model, _ORIGINAL_ATTN_IMPL_ATTR)
+    def activate(self) -> Any:
+        return use_thriftattention_cache(self.past_key_values)
 
-    for module in _iter_modules(model):
-        if hasattr(module, _CONFIG_ATTR):
-            delattr(module, _CONFIG_ATTR)
+    def trim_padding(self) -> None:
+        if self.padding:
+            self.past_key_values.crop(self.prompt_length)
 
-    if hasattr(model, _PATCHED_ATTR):
-        delattr(model, _PATCHED_ATTR)
-    return model
+
+def register_transformers_attention(config: TransformersAttentionConfig | None = None) -> str:
+    config = config or TransformersAttentionConfig()
+    name = _validate_attention_name(config.name)
+    _register_transformers_attention_impl(name, config.attention_config())
+    return name
+
+
+def get_registered_transformers_attention_config(name: str) -> AttentionConfig | None:
+    return _REGISTERED_CONFIGS.get(name)
+
+
+def prepare_transformers_generation_cache(
+    model: object,
+    input_ids: torch.Tensor | list[int] | tuple[int, ...],
+    *,
+    config: AttentionConfig | TransformersAttentionConfig | None = None,
+    max_new_tokens: int = 0,
+    device: torch.device | str | None = None,
+    pad_to_block: bool = True,
+) -> TransformersCacheInputs:
+    active_config = _coerce_attention_config(config) if config is not None else _model_config(model)
+    prompt_length = _input_ids_length(input_ids)
+    active_config = _generation_cache_config(active_config, prompt_length)
+
+    if isinstance(input_ids, torch.Tensor):
+        encoded = input_ids.to(device=device) if device is not None else input_ids
+        if encoded.ndim == 1:
+            encoded = encoded.unsqueeze(0)
+        elif encoded.ndim != 2:
+            raise ValueError("input_ids tensor must be rank 1 or rank 2")
+    else:
+        encoded = torch.tensor([list(input_ids)], dtype=torch.long, device=device)
+
+    padding = (-prompt_length) % active_config.block_size if pad_to_block else 0
+    if padding:
+        pad = torch.zeros(
+            encoded.shape[0],
+            padding,
+            dtype=encoded.dtype,
+            device=encoded.device,
+        )
+        encoded = torch.cat([encoded, pad], dim=1)
+
+    cache_position = torch.arange(encoded.shape[1], device=encoded.device, dtype=torch.long)
+    past = ThriftAttentionCache.from_model(
+        model,
+        config=active_config,
+        max_cache_len=encoded.shape[1] + int(max_new_tokens),
+    )
+    past.prefill_real_seq_len = prompt_length
+    return TransformersCacheInputs(
+        input_ids=encoded,
+        cache_position=cache_position,
+        past_key_values=past,
+        prompt_length=prompt_length,
+        padded_length=int(encoded.shape[1]),
+        padding=padding,
+        config=active_config,
+    )
 
 
 def thriftattention_forward(
@@ -156,106 +198,11 @@ def thriftattention_forward(
     return output.transpose(1, 2).contiguous(), None
 
 
-def _patch_generate(model: object, config: AttentionConfig) -> None:
-    setattr(model, _GENERATION_CONFIG_ATTR, config)
-    if hasattr(model, _ORIGINAL_GENERATE_ATTR):
-        return
-    original_generate = getattr(model, "generate", None)
-    if not callable(original_generate):
-        return
-
-    def thriftattention_generate(*args: Any, **kwargs: Any) -> Any:
-        active_config = getattr(model, _GENERATION_CONFIG_ATTR, config)
-        return _generate_with_thriftattention_cache(
-            model,
-            original_generate,
-            active_config,
-            *args,
-            **kwargs,
-        )
-
-    setattr(model, _ORIGINAL_GENERATE_ATTR, original_generate)
-    setattr(model, "generate", thriftattention_generate)
-
-
-def _generate_with_thriftattention_cache(
-    model: object,
-    original_generate: Callable[..., Any],
-    config: AttentionConfig,
-    *args: Any,
-    **kwargs: Any,
-) -> Any:
-    explicit_cache = kwargs.get("past_key_values", None)
-    if is_thriftattention_cache(explicit_cache):
-        with use_thriftattention_cache(explicit_cache):
-            return original_generate(*args, **kwargs)
-
-    if not _should_inject_generation_cache(model, kwargs):
-        return original_generate(*args, **kwargs)
-
-    cache = ThriftAttentionCache.from_model(
-        model,
-        config=config,
-        max_cache_len=_infer_generation_cache_length(model, args, kwargs),
-    )
-    patched_kwargs = dict(kwargs)
-    patched_kwargs["past_key_values"] = cache
-    patched_kwargs.setdefault("use_cache", True)
-    with use_thriftattention_cache(cache):
-        return original_generate(*args, **patched_kwargs)
-
-
-def _should_inject_generation_cache(model: object, kwargs: dict[str, Any]) -> bool:
-    if getattr(model, "training", False):
-        return False
-    model_config = getattr(model, "config", None)
-    if bool(getattr(model_config, "is_encoder_decoder", False)):
-        return False
-    if kwargs.get("use_cache", True) is False:
-        return False
-    if kwargs.get("past_key_values", None) is not None:
-        return False
-    if kwargs.get("cache_implementation", None) is not None:
-        return False
-    return True
-
-
-def _infer_generation_cache_length(
-    model: object,
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> int | None:
-    max_length = kwargs.get("max_length", None)
-    if max_length is not None:
-        return int(max_length)
-
-    prompt_len = _infer_prompt_length(args, kwargs)
-    max_new_tokens = kwargs.get("max_new_tokens", None)
-    if prompt_len is not None and max_new_tokens is not None:
-        return int(prompt_len + max_new_tokens)
-
-    generation_config = kwargs.get("generation_config", getattr(model, "generation_config", None))
-    max_length = getattr(generation_config, "max_length", None)
-    if max_length is not None:
-        return int(max_length)
-
-    model_config = getattr(model, "config", None)
-    max_positions = getattr(model_config, "max_position_embeddings", None)
-    if max_positions is not None:
-        return int(max_positions)
-    return None
-
-
-def _infer_prompt_length(args: tuple[Any, ...], kwargs: dict[str, Any]) -> int | None:
-    inputs = kwargs.get("input_ids", None)
-    if inputs is None and args:
-        inputs = args[0]
-    if isinstance(inputs, torch.Tensor) and inputs.ndim >= 2:
-        return int(inputs.shape[1])
-    inputs_embeds = kwargs.get("inputs_embeds", None)
-    if isinstance(inputs_embeds, torch.Tensor) and inputs_embeds.ndim >= 2:
-        return int(inputs_embeds.shape[1])
-    return None
+def _register_transformers_attention_impl(name: str, config: AttentionConfig) -> None:
+    registry = _get_attention_registry()
+    _REGISTERED_CONFIGS[name] = config
+    _register_once(registry, name, thriftattention_forward)
+    _register_attention_mask(name)
 
 
 def _get_attention_registry() -> Any:
@@ -266,18 +213,19 @@ def _get_attention_registry() -> Any:
             from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS as AttentionInterface
         except Exception as exc:
             raise ImportError(
-                "backend='hf' requires Hugging Face Transformers with AttentionInterface support"
+                "register_transformers_attention() requires Hugging Face Transformers "
+                "with AttentionInterface support"
             ) from exc
     return AttentionInterface
 
 
-def _register_attention_mask() -> None:
+def _register_attention_mask(name: str = DEFAULT_TRANSFORMERS_ATTENTION_NAME) -> None:
     try:
         from transformers import AttentionMaskInterface
         from transformers.masking_utils import sdpa_mask
     except Exception:
         return
-    _register_once(AttentionMaskInterface, BACKEND_NAME, sdpa_mask)
+    _register_once(AttentionMaskInterface, name, sdpa_mask)
 
 
 def _register_once(registry: Any, name: str, fn: Callable[..., Any]) -> None:
@@ -288,41 +236,101 @@ def _register_once(registry: Any, name: str, fn: Callable[..., Any]) -> None:
             raise
 
 
-def _iter_modules(model: object) -> list[object]:
-    modules = getattr(model, "modules", None)
-    if callable(modules):
-        return list(modules())
-    return [model]
-
-
-def _current_attn_implementation(model: object) -> object:
-    config = getattr(model, "config", None)
-    if config is None:
-        return None
-    return getattr(config, "_attn_implementation", None)
-
-
-def _set_attn_implementation(model: object, name: object) -> None:
-    _attn_implementation_setter(model)(name)
-
-
-def _attn_implementation_setter(model: object) -> Callable[[object], None]:
-    setter = getattr(model, "set_attn_implementation", None)
-    if not callable(setter):
-        raise TypeError(
-            "backend='hf' requires a Transformers model with set_attn_implementation()"
-        )
-    return setter
-
-
 def _module_config(module: torch.nn.Module) -> AttentionConfig:
-    config = getattr(module, _CONFIG_ATTR, None)
-    if config is None:
-        raise RuntimeError(
-            "ThriftAttention HF backend was called on an unpatched module. "
-            "Call thriftattention.patch_model(model, backend='hf') first."
+    cache = get_active_thriftattention_cache()
+    if cache is not None:
+        return cache.config
+
+    name = _module_attn_implementation(module)
+    if name is not None and name in _REGISTERED_CONFIGS:
+        return _REGISTERED_CONFIGS[name]
+
+    raise RuntimeError(
+        "ThriftAttention was called for an unregistered Transformers attention "
+        "implementation. Call register_transformers_attention(...) before loading "
+        "or setting a model with attn_implementation=<registered name>."
+    )
+
+
+def _model_config(model: object) -> AttentionConfig:
+    name = _module_attn_implementation(model)
+    if name is not None and name in _REGISTERED_CONFIGS:
+        return _REGISTERED_CONFIGS[name]
+    raise RuntimeError(
+        "could not infer a registered ThriftAttention config from model.config; "
+        "pass config= explicitly"
+    )
+
+
+def _module_attn_implementation(module: object) -> str | None:
+    config = getattr(module, "config", None)
+    name = getattr(config, "_attn_implementation", None)
+    return name if isinstance(name, str) else None
+
+
+def _coerce_attention_config(config: AttentionConfig | TransformersAttentionConfig) -> AttentionConfig:
+    if isinstance(config, TransformersAttentionConfig):
+        return config.attention_config()
+    if isinstance(config, AttentionConfig):
+        return config
+    raise TypeError("config must be an AttentionConfig or TransformersAttentionConfig")
+
+
+def _generation_cache_config(config: AttentionConfig, prompt_length: int) -> AttentionConfig:
+    if config.mode != "thrift" or config.top_k is not None:
+        return config
+    blocks = max(prompt_length // config.block_size, 1)
+    top_k = resolve_top_k(blocks, causal=True, fraction=config.fp16_fraction)
+    return replace(config, top_k=top_k)
+
+
+def _input_ids_length(input_ids: torch.Tensor | list[int] | tuple[int, ...]) -> int:
+    if isinstance(input_ids, torch.Tensor):
+        if input_ids.ndim == 1:
+            return int(input_ids.shape[0])
+        if input_ids.ndim == 2:
+            return int(input_ids.shape[1])
+        raise ValueError("input_ids tensor must be rank 1 or rank 2")
+    return len(input_ids)
+
+
+def _validate_attention_name(name: str) -> str:
+    if not isinstance(name, str) or not name or name.strip() != name:
+        raise ValueError(
+            "attention implementation name must be a non-empty string without "
+            "surrounding whitespace"
         )
-    return config
+    return name
+
+
+def _validate_choice(name: str, value: str, choices: tuple[str, ...]) -> str:
+    if value not in choices:
+        formatted = ", ".join(repr(choice) for choice in choices)
+        raise ValueError(f"{name} must be one of {formatted}, got {value!r}")
+    return value
+
+
+def _validate_fraction(value: float) -> float:
+    value = float(value)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"fp16_fraction must be in [0, 1], got {value!r}")
+    return value
+
+
+def _validate_top_k(value: int | None) -> int | None:
+    if value is None:
+        return None
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"top_k must be non-negative, got {value!r}")
+    return value
+
+
+def _validate_block_size(value: int) -> int:
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"block_size must be positive, got {value!r}")
+    return value
 
 
 def _fast_path_rejection_reason(

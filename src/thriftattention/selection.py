@@ -31,10 +31,6 @@ def resolve_top_k(
     if not causal:
         return max(1, min(num_blocks, round(fraction * num_blocks)))
 
-    # Fixed top_k under causal attention promotes:
-    #   k*n - k*(k-1)/2
-    # block pairs out of n*(n+1)/2 visible block pairs. Use the smaller
-    # quadratic root to match a requested causal FP16-pair budget.
     b = -(2 * num_blocks + 1)
     c = fraction * num_blocks * (num_blocks + 1)
     discriminant = b * b - 4.0 * c

@@ -1,6 +1,5 @@
 from .functional import attention, fp4_attention
 from .integrations.transformers_cache import ThriftAttentionCache
-from .patch import patch_model, unpatch_model
 from .quantization import (
     nvfp4_quantize,
     nvfp4_quantize_permuted,
@@ -13,8 +12,6 @@ __all__ = [
     "attention",
     "fp4_attention",
     "ThriftAttentionCache",
-    "patch_model",
-    "unpatch_model",
     "nvfp4_quantize",
     "nvfp4_quantize_permuted",
     "nvfp4_quantize_transposed",

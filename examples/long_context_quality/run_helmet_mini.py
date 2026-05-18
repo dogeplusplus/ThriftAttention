@@ -10,27 +10,30 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import fmean
 
-from dataset_utils import ruler_gen, ruler_score
-
+from dataset_utils import helmet_gen, helmet_score
 
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
 FLASH_ATTN_IMPLEMENTATION = "flash_attention_2"
 METHODS = {
     "fp16": "fp16",
+    "flash": "fp16",
+    "flashattn": "fp16",
+    "flash-attn": "fp16",
     "fp4": "fp4",
     "thrift": "thrift",
 }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Mini RULER generation benchmark.")
+    parser = argparse.ArgumentParser(description="Mini HELMET generation benchmark.")
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--lengths", default="32768")
-    parser.add_argument("--tasks", default="niah_multikey_3")
+    parser.add_argument("--lengths", default="65536")
+    parser.add_argument("--tasks", default="json_kv,kilt_popqa_3,narrativeqa")
     parser.add_argument("--methods", default="fp16,fp4,thrift")
     parser.add_argument("--fractions", default="0.05")
     parser.add_argument("--num-examples", type=int, default=20)
     parser.add_argument("--max-new-tokens", type=int, default=0)
+    parser.add_argument("--helmet-data-dir", type=Path, default=None)
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=1234)
@@ -44,7 +47,7 @@ def main() -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     lengths = [int(x) for x in args.lengths.replace(" ", ",").split(",") if x.strip()]
-    tasks = [x.strip() for x in args.tasks.split(",") if x.strip()]
+    tasks = [helmet_gen.normalize_task(x) for x in args.tasks.split(",") if x.strip()]
     methods = [x.strip() for x in args.methods.split(",") if x.strip()]
     fractions = [float(x) for x in args.fractions.replace(" ", ",").split(",") if x.strip()]
 
@@ -56,7 +59,7 @@ def main() -> None:
     out_dir = None
     if args.output:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        out_dir = args.output / f"{stamp}-ruler-mini"
+        out_dir = args.output / f"{stamp}-helmet-mini"
         out_dir.mkdir(parents=True)
         (out_dir / "environment.json").write_text(json.dumps(vars(args), indent=2, sort_keys=True, default=str) + "\n")
 
@@ -94,7 +97,18 @@ def main() -> None:
 
             for length in lengths:
                 for task in tasks:
-                    samples = ruler_gen.generate_samples(tokenizer, task, length, args.num_examples, args.seed, args.cache_dir)
+                    samples = helmet_gen.generate_samples(
+                        tokenizer,
+                        task,
+                        length,
+                        args.num_examples,
+                        args.seed,
+                        args.cache_dir,
+                        args.helmet_data_dir,
+                    )
+                    if not samples:
+                        print(f"  len={length:<6} task={task:<17} no samples")
+                        continue
 
                     for index, sample in enumerate(samples):
                         prompt = sample["input"] + sample["answer_prefix"]
@@ -155,7 +169,9 @@ def main() -> None:
 
                         decode_steps = max(0, len(generated) - 1)
                         prediction = tokenizer.decode(generated, skip_special_tokens=True).strip()
-                        accuracy = float(ruler_score.score_sample(task, prediction, sample["outputs"]))
+                        if sample.get("stop_newline"):
+                            prediction = prediction.splitlines()[0].strip() if prediction else prediction
+                        accuracy = float(helmet_score.score_sample(task, prediction, sample))
                         row = {
                             "method": method,
                             "label": label,
@@ -163,6 +179,8 @@ def main() -> None:
                             "length": length,
                             "sample_length": sample.get("length"),
                             "task": task,
+                            "category": sample.get("category"),
+                            "metric": sample.get("metric"),
                             "example": index,
                             "status": "ok",
                             "outputs": sample["outputs"],
@@ -223,7 +241,7 @@ def main() -> None:
         with (out_dir / "metrics.jsonl").open("w", encoding="utf-8") as handle:
             for row in rows:
                 handle.write(json.dumps(row, sort_keys=True) + "\n")
-        (out_dir / "summary.md").write_text("# RULER Mini\n\n" + table + "\n", encoding="utf-8")
+        (out_dir / "summary.md").write_text("# HELMET Mini\n\n" + table + "\n", encoding="utf-8")
         print(f"\nWrote {out_dir}")
 
 

@@ -215,10 +215,31 @@ class ThriftAttentionCacheLayer:
     def crop(self, max_length: int) -> None:
         if max_length < 0:
             max_length = max(self.seq_len + max_length, 0)
-        self.seq_len = min(self.seq_len, max_length)
+        new_len = min(self.seq_len, max_length)
+        if new_len < self.seq_len:
+            self._zero_physical_tail(new_len)
+        self.seq_len = new_len
 
     def reset(self) -> None:
         self.seq_len = 0
+
+    def _zero_physical_tail(self, logical_len: int) -> None:
+        if self.k_fp16 is None or self.v_fp16 is None:
+            return
+        key_end = min(max(64, _round_up(logical_len, 64)), self.k_fp16.shape[2])
+        value_end = min(_round_up(key_end, 128), self.v_fp16.shape[2])
+        if logical_len < key_end:
+            self.k_fp16[:, :, logical_len:key_end].zero_()
+            if self.k_packed is not None and self.k_scale is not None:
+                self._quantize_k_range(
+                    self.k_fp16[:, :, logical_len:key_end].contiguous(),
+                    logical_len,
+                    key_end,
+                )
+        if logical_len < value_end:
+            self.v_fp16[:, :, logical_len:value_end].zero_()
+            if self.v_packed_t is not None and self.v_scale_t is not None:
+                self._quantize_v_range(logical_len, value_end)
 
     def _ensure_capacity(self, like: torch.Tensor, required: int) -> None:
         if self.k_fp16 is not None:

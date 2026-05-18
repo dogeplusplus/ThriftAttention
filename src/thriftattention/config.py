@@ -6,7 +6,6 @@ from typing import Literal
 
 AttentionMode = Literal["thrift", "fp4"]
 SelectionMethod = Literal["block_mean"]
-PatchBackend = Literal["auto", "hf"]
 FallbackBackend = Literal["error"]
 
 
@@ -18,6 +17,4 @@ class AttentionConfig:
     fp16_fraction: float = 0.05
     top_k: int | None = None
     block_size: int = 64
-    backend: PatchBackend = "auto"
     fallback: FallbackBackend = "error"
-    patch_generation: bool = True
