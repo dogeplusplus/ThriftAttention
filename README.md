@@ -52,7 +52,7 @@ Q is shaped `[batch, query_heads, query_len, head_dim]`; K and V are shaped `[ba
 Prerequisites:
 
 - Python >=3.10
-- CUDA toolkit >=12.8 with `nvcc` available
+- CUDA toolkit >=12.8
 - PyTorch >=2.8.0 built with CUDA >=12.8
 - Transformers >=4.52
 
