@@ -52,7 +52,7 @@ import torch
 from transformers import AutoModelForCausalLM
 from thriftattention.integrations.transformers import register_transformers_attention
 attn = register_transformers_attention()
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", attn_implementation=attn, torch_dtype=torch.float16, device_map="auto")
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", attn_implementation=attn, torch_dtype=torch.float16)
 ```
 
 
