@@ -11,7 +11,6 @@ Paper: TODO add arxiv Link
     <strong>Figure 1:</strong> Pareto frontier of performance vs inference efficiency trade-off at 131k context length. Quality recovery is measured as the percentage of the FP4-to-FP16 NLL gap recovered. 
   </figcaption>
 </figure>
-\toprule
 
 
 ## Average long-context performance
