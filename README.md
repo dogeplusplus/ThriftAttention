@@ -65,4 +65,15 @@ python -m pip install -e . --no-build-isolation
 ```
 
 ## Citation
-TODO
+If you use ThriftAttention library in your research please cite as:
+```
+@misc{sharratt2026thriftattention,
+  title         = {{ThriftAttention}: Selective Mixed Precision for Long-Context {FP4} Attention},
+  author        = {Sharratt, Joe},
+  year          = {2026},
+  eprint        = {2605.23081},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2605.23081},
+}
+```
