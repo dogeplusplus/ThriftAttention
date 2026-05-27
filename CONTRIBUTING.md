@@ -29,5 +29,5 @@ python -m pip install -e . --no-build-isolation
 3. Running the examples 
 Check out the ReadME in `examples/` for instruction on running individual mini evaluations
 
-4. Raising an issue. For any issues/further features please open a github issue.
+4. Raising an issue. For any issues/further features please open a github issue. 
 

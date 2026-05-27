@@ -64,6 +64,10 @@ python -m pip install 'torch>=2.8.0'
 python -m pip install -e . --no-build-isolation
 ```
 
+## Contributing
+
+Please see `Contributing.md`
+
 ## Citation
 If you use ThriftAttention library in your research please cite as:
 ```
