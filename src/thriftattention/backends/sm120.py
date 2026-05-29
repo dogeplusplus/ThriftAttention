@@ -31,8 +31,10 @@ class Sm120Nvfp4Backend:
         check_qkv(q, k, v)
         if config.block_size != 64:
             raise NotImplementedError("the current SM120 attention kernels use 64-token KV blocks")
-        if quant_format.name != "nvfp4":
+        if quant_format.name not in ("nvfp4", "mxfp4"):
             raise NotImplementedError(f"SM120 backend does not support quant format {quant_format.name!r}")
+        if quant_format.name == "mxfp4" and _use_single_query(q, config.implementation):
+            raise NotImplementedError("SM120 MXFP4 backend currently supports tiled attention only")
 
         if _use_single_query(q, config.implementation):
             return self._single_query_attention(q, k, v, selection, quant_format, config, is_bf16)
@@ -92,20 +94,34 @@ class Sm120Nvfp4Backend:
         ext = get_extension()
 
         if config.method == "fp4":
-            fn = (
-                ext.fp4_attention_causal_nvfp4_packed
-                if config.causal
-                else ext.fp4_attention_noncausal_nvfp4_packed
-            )
+            if quant_format.name == "mxfp4":
+                fn = (
+                    ext.fp4_attention_causal_mxfp4_packed
+                    if config.causal
+                    else ext.fp4_attention_noncausal_mxfp4_packed
+                )
+            else:
+                fn = (
+                    ext.fp4_attention_causal_nvfp4_packed
+                    if config.causal
+                    else ext.fp4_attention_noncausal_nvfp4_packed
+                )
             return fn(*packed, is_bf16)
         if config.method == "thrift":
             if selection is None:
                 raise ValueError("thrift attention requires a selection tensor")
-            fn = (
-                ext.thrift_attention_causal_nvfp4_packed
-                if config.causal
-                else ext.thrift_attention_noncausal_nvfp4_packed
-            )
+            if quant_format.name == "mxfp4":
+                fn = (
+                    ext.thrift_attention_causal_mxfp4_packed
+                    if config.causal
+                    else ext.thrift_attention_noncausal_mxfp4_packed
+                )
+            else:
+                fn = (
+                    ext.thrift_attention_causal_nvfp4_packed
+                    if config.causal
+                    else ext.thrift_attention_noncausal_nvfp4_packed
+                )
             return fn(q, k, v, selection, *packed, is_bf16)
         raise ValueError(f"unsupported attention method {config.method!r}")
 

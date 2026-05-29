@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+import pytest
+
+torch = pytest.importorskip("torch")
+F = pytest.importorskip("torch.nn.functional")
+_C = pytest.importorskip("thriftattention._C")
+
+
+CONTEXT_LENGTHS = (4096, 8192, 32768, 131072)
+DTYPES = (torch.float16, torch.bfloat16)
+
+
+def _requires_sm120_cuda() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    if torch.cuda.get_device_capability() < (12, 0):
+        pytest.skip("SM120 CUDA device required")
+
+
+def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    return F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
+
+
+def _mxfp4_quantize_qkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    is_bf16: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_packed, q_scale = _C.mxfp4_quantize(q, is_bf16)
+    k_packed, k_scale = _C.mxfp4_quantize_permuted(k, is_bf16)
+    v_packed_t, v_scale_t = _C.mxfp4_quantize_transposed(v, is_bf16)
+    return q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("kv_len", CONTEXT_LENGTHS)
+def test_tiled_mxfp4_attention_matches_sdpa(dtype: torch.dtype, kv_len: int) -> None:
+    _requires_sm120_cuda()
+    torch.manual_seed(2)
+    device = torch.device("cuda")
+    is_bf16 = dtype == torch.bfloat16
+    batch, q_heads, kv_heads, seq_len, head_dim = 1, 2, 1, kv_len, 64
+    groups = q_heads // kv_heads
+
+    q = (torch.randn(batch, q_heads, seq_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
+    k = (torch.randn(batch, kv_heads, seq_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
+    v = (torch.randn(batch, kv_heads, seq_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
+
+    packed = _mxfp4_quantize_qkv(q, k, v, is_bf16=is_bf16)
+    fp4_out = _C.fp4_attention_causal_mxfp4_packed(*packed, is_bf16)
+
+    num_q_blocks = seq_len // 64
+    num_kv_blocks = seq_len // 64
+    selected = (
+        torch.arange(num_kv_blocks, device=device, dtype=torch.int32)
+        .view(1, 1, num_kv_blocks)
+        .expand(batch * q_heads, num_q_blocks, num_kv_blocks)
+        .contiguous()
+    )
+    thrift_out = _C.thrift_attention_causal_mxfp4_packed(q, k, v, selected, *packed, is_bf16)
+
+    k_ref = k.repeat_interleave(groups, dim=1)
+    v_ref = v.repeat_interleave(groups, dim=1)
+    ref = F.scaled_dot_product_attention(q.float(), k_ref.float(), v_ref.float(), is_causal=True)
+
+    torch.cuda.synchronize()
+    assert fp4_out.dtype == dtype
+    assert thrift_out.dtype == dtype
+    assert _cosine(fp4_out, ref) > 0.95
+    assert _cosine(thrift_out, ref) > 0.95
