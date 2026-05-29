@@ -86,12 +86,14 @@ def test_single_query_attention_cosine_4k_to_131k(dtype: torch.dtype, kv_len: in
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_tiled_attention_cosine(dtype: torch.dtype) -> None:
+@pytest.mark.parametrize("kv_len", CONTEXT_LENGTHS)
+def test_tiled_attention_cosine(dtype: torch.dtype, kv_len: int) -> None:
     _requires_sm120_cuda()
     torch.manual_seed(1)
     device = torch.device("cuda")
     is_bf16 = dtype == torch.bfloat16
-    batch, q_heads, kv_heads, q_len, kv_len, head_dim = 1, 2, 1, 64, 4096, 64
+    q_len = kv_len
+    batch, q_heads, kv_heads, head_dim = 1, 2, 1, 64
     groups = q_heads // kv_heads
 
     q = (torch.randn(batch, q_heads, q_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
@@ -99,7 +101,7 @@ def test_tiled_attention_cosine(dtype: torch.dtype) -> None:
     v = (torch.randn(batch, kv_heads, kv_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
 
     packed = _quantize_qkv(q, k, v, is_bf16=is_bf16, permute_k=True)
-    fp4_out = _C.fp4_attention_noncausal_nvfp4_packed(*packed, is_bf16)
+    fp4_out = _C.fp4_attention_causal_nvfp4_packed(*packed, is_bf16)
 
     num_q_blocks = q_len // 64
     num_kv_blocks = kv_len // 64
@@ -109,11 +111,11 @@ def test_tiled_attention_cosine(dtype: torch.dtype) -> None:
         .expand(batch * q_heads, num_q_blocks, num_kv_blocks)
         .contiguous()
     )
-    thrift_out = _C.thrift_attention_noncausal_nvfp4_packed(q, k, v, selected, *packed, is_bf16)
+    thrift_out = _C.thrift_attention_causal_nvfp4_packed(q, k, v, selected, *packed, is_bf16)
 
     k_ref = k.repeat_interleave(groups, dim=1)
     v_ref = v.repeat_interleave(groups, dim=1)
-    ref = F.scaled_dot_product_attention(q.float(), k_ref.float(), v_ref.float(), is_causal=False)
+    ref = F.scaled_dot_product_attention(q.float(), k_ref.float(), v_ref.float(), is_causal=True)
 
     torch.cuda.synchronize()
     assert _cosine(fp4_out, ref) > 0.95
