@@ -208,25 +208,35 @@ def test_sm120_backend_dispatches_fp4_mxfp4_extension(monkeypatch):
     assert calls == [("mxfp4_causal", ("qp", "kp", "vp", "qs", "ks", "vs", False))]
 
 
-def test_sm120_backend_rejects_mxfp4_single_query(monkeypatch):
+def test_sm120_backend_dispatches_mxfp4_single_query_extension(monkeypatch):
     from thriftattention.backends import sm120 as sm120_backend
 
+    calls = []
     q = torch.empty(1, 1, 1, 64)
     k = torch.empty(1, 1, 64, 64)
     v = torch.empty(1, 1, 64, 64)
 
-    monkeypatch.setattr(sm120_backend, "check_qkv", lambda *args, **kwargs: None)
+    def fake_single_query(*args):
+        calls.append(("mxfp4_single_query", args))
+        return torch.empty(1, 1, 1, 64)
 
-    with pytest.raises(NotImplementedError, match="MXFP4 backend currently supports tiled"):
-        sm120_backend.Sm120Nvfp4Backend().attention(
-            q,
-            k,
-            v,
-            selection=None,
-            quant_format=FakeQuantFormat("mxfp4"),
-            config=AttentionConfig(method="fp4", implementation="auto"),
-            is_bf16=False,
-        )
+    ext = SimpleNamespace(fp4_attention_single_query_mxfp4_packed=fake_single_query)
+    monkeypatch.setattr(sm120_backend, "check_qkv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sm120_backend, "require_block_aligned", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sm120_backend, "get_extension", lambda: ext)
+
+    out = sm120_backend.Sm120Nvfp4Backend().attention(
+        q,
+        k,
+        v,
+        selection=None,
+        quant_format=FakeQuantFormat("mxfp4"),
+        config=AttentionConfig(method="fp4", implementation="auto"),
+        is_bf16=False,
+    )
+
+    assert out.shape == q.shape
+    assert calls == [("mxfp4_single_query", ("qp", "kp", "vp", "qs", "ks", "vs", False))]
 
 
 def test_sm120_backend_dispatches_thrift_single_query_extension(monkeypatch):

@@ -33,8 +33,6 @@ class Sm120Nvfp4Backend:
             raise NotImplementedError("the current SM120 attention kernels use 64-token KV blocks")
         if quant_format.name not in ("nvfp4", "mxfp4"):
             raise NotImplementedError(f"SM120 backend does not support quant format {quant_format.name!r}")
-        if quant_format.name == "mxfp4" and _use_single_query(q, config.implementation):
-            raise NotImplementedError("SM120 MXFP4 backend currently supports tiled attention only")
 
         if _use_single_query(q, config.implementation):
             return self._single_query_attention(q, k, v, selection, quant_format, config, is_bf16)
@@ -59,11 +57,21 @@ class Sm120Nvfp4Backend:
         ext = get_extension()
 
         if config.method == "fp4":
-            out = ext.fp4_attention_single_query_nvfp4_packed(*packed, is_bf16)
+            fn = (
+                ext.fp4_attention_single_query_mxfp4_packed
+                if quant_format.name == "mxfp4"
+                else ext.fp4_attention_single_query_nvfp4_packed
+            )
+            out = fn(*packed, is_bf16)
         elif config.method == "thrift":
             if selection is None:
                 raise ValueError("thrift attention requires a selection tensor")
-            out = ext.thrift_attention_single_query_nvfp4_packed(
+            fn = (
+                ext.thrift_attention_single_query_mxfp4_packed
+                if quant_format.name == "mxfp4"
+                else ext.thrift_attention_single_query_nvfp4_packed
+            )
+            out = fn(
                 q_grouped,
                 k,
                 v,

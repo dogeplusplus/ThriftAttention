@@ -80,6 +80,13 @@ void fp4_attention_single_query_nvfp4(
     void* O, void* workspace,
     int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+// Implemented in csrc/cuda/sm120/mxfp4/single_query_fp4_attention.cu.
+void fp4_attention_single_query_mxfp4(
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, void* workspace,
+    int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
 
 // Implemented in csrc/cuda/sm120/nvfp4/thrift_attention.cu.
 void thrift_attention_causal_nvfp4(
@@ -128,6 +135,15 @@ void thrift_attention_single_query_nvfp4(
     void* O, void* workspace,
     int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+// Implemented in csrc/cuda/sm120/mxfp4/single_query_attention.cu.
+void thrift_attention_single_query_mxfp4(
+    const void* Q_fp16, const void* K_fp16, const void* V_fp16,
+    const int32_t* selected_blocks, int topk_count,
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, void* workspace,
+    int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
 
 // Implemented in csrc/cuda/sm120/nvfp4/quantization.cu.
 void nvfp4_quantise(void* X, void* X_fp4, void* X_scale, int bs, int seq_len, int head_dim, bool is_bf16);
@@ -144,7 +160,7 @@ void mxfp4_quantise_transpose(void* X, void* X_fp4, void* X_scale, int bs, int s
 void mxfp4_quantise_transpose_permute_seq(
     void* X, void* X_fp4, void* X_scale, int bs, int seq_len, int head_dim, bool inverse, bool is_bf16);
 
-// Implemented in csrc/cuda/sm120/nvfp4/block_selection.cu.
+// Implemented in csrc/cuda/sm120/shared/block_selection.cu.
 void block_mean_topk(
     const void* q_mean,
     const void* k_mean,
@@ -353,6 +369,60 @@ static at::Tensor fp4_attention_single_query_nvfp4_packed(
 
     auto dispatch = [&](void* workspace) {
         fp4_attention_single_query_nvfp4(
+            q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+            q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+            out.data_ptr(), workspace,
+            flat_q_heads, q_len, kv_len, kv_capacity,
+            num_q_heads, num_kv_heads, head_dim, is_bf16);
+    };
+
+    if (!use_split) {
+        dispatch(nullptr);
+        return out;
+    }
+
+    int num_kv_splits = std::max(1, std::min(total_kv_blocks, (256 + flat_q_heads - 1) / flat_q_heads));
+    num_kv_splits = std::min(num_kv_splits, total_kv_blocks);
+    const int64_t workspace_elems =
+        static_cast<int64_t>(flat_q_heads) * num_kv_splits * 16 * (head_dim + 2) + flat_q_heads;
+    at::Tensor workspace = at::empty({workspace_elems},
+        at::TensorOptions().dtype(at::kFloat).device(q_packed.device()));
+    dispatch(workspace.data_ptr());
+    return out;
+}
+
+static at::Tensor fp4_attention_single_query_mxfp4_packed(
+    const at::Tensor& q_packed,
+    const at::Tensor& k_packed,
+    const at::Tensor& v_packed_t,
+    const at::Tensor& q_scale,
+    const at::Tensor& k_scale,
+    const at::Tensor& v_scale_t,
+    bool is_bf16 = false) {
+    check_packed_qkv(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t);
+
+    const int batch = q_packed.size(0);
+    const int num_q_heads = q_packed.size(1);
+    const int num_kv_heads = k_packed.size(1);
+    const int flat_q_heads = batch * num_q_heads;
+    const int q_len = q_packed.size(2);
+    const int kv_len = k_packed.size(2);
+    const int head_dim = q_packed.size(3) * 2;
+    const int kv_capacity = static_cast<int>(k_packed.stride(1)) / (head_dim / 2);
+    const at::ScalarType out_dtype = is_bf16 ? at::kBFloat16 : at::kHalf;
+    TORCH_CHECK(q_len >= 1 && q_len <= 16,
+                "single-query FP4 attention expects grouped query length in [1, 16], got ",
+                q_len);
+
+    at::Tensor out = at::empty({batch, num_q_heads, q_len, head_dim},
+        at::TensorOptions().dtype(out_dtype).device(q_packed.device()));
+
+    constexpr int block_kv = 64;
+    const int total_kv_blocks = (kv_len + block_kv - 1) / block_kv;
+    const bool use_split = total_kv_blocks >= 128;
+
+    auto dispatch = [&](void* workspace) {
+        fp4_attention_single_query_mxfp4(
             q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
             q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
             out.data_ptr(), workspace,
@@ -674,6 +744,87 @@ static at::Tensor thrift_attention_single_query_nvfp4_packed(
 
     auto dispatch = [&](void* workspace) {
         thrift_attention_single_query_nvfp4(
+            q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
+            static_cast<const int32_t*>(selected_blocks.data_ptr()), topk_count,
+            q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+            q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+            out.data_ptr(), workspace,
+            flat_q_heads, q_len, kv_len, kv_capacity,
+            num_q_heads, num_kv_heads, head_dim, is_bf16);
+    };
+
+    if (!use_split) {
+        dispatch(nullptr);
+        return out;
+    }
+
+    const int target_split_ctas = single_query_mixed_target_split_ctas(total_kv_blocks);
+    int num_kv_splits =
+        std::max(1, std::min(total_kv_blocks, (target_split_ctas + flat_q_heads - 1) / flat_q_heads));
+    num_kv_splits = std::min(num_kv_splits, total_kv_blocks);
+    const int64_t workspace_elems =
+        static_cast<int64_t>(flat_q_heads) * num_kv_splits * q_len * (head_dim + 2) + flat_q_heads;
+    at::Tensor workspace = at::empty({workspace_elems},
+        at::TensorOptions().dtype(at::kFloat).device(q_packed.device()));
+    dispatch(workspace.data_ptr());
+    return out;
+}
+
+static at::Tensor thrift_attention_single_query_mxfp4_packed(
+    const at::Tensor& q_hi,
+    const at::Tensor& k_hi,
+    const at::Tensor& v_hi,
+    const at::Tensor& selected_blocks,
+    const at::Tensor& q_packed,
+    const at::Tensor& k_packed,
+    const at::Tensor& v_packed_t,
+    const at::Tensor& q_scale,
+    const at::Tensor& k_scale,
+    const at::Tensor& v_scale_t,
+    bool is_bf16 = false) {
+    check_hi_qkv(q_hi, k_hi, v_hi);
+    check_packed_qkv(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t);
+    TORCH_CHECK(selected_blocks.is_cuda(), "selected_blocks must be a CUDA tensor");
+    TORCH_CHECK(selected_blocks.dtype() == at::kInt, "selected_blocks must be int32");
+    TORCH_CHECK(selected_blocks.is_contiguous(), "selected_blocks must be contiguous");
+    TORCH_CHECK(selected_blocks.dim() == 2,
+                "selected_blocks must be [batch * grouped_heads, top_k]");
+
+    const int batch = q_packed.size(0);
+    const int num_q_heads = q_packed.size(1);
+    const int num_kv_heads = k_packed.size(1);
+    const int flat_q_heads = batch * num_q_heads;
+    const int q_len = q_packed.size(2);
+    const int kv_len = k_packed.size(2);
+    const int head_dim = q_packed.size(3) * 2;
+    const int topk_count = selected_blocks.size(1);
+    const int kv_capacity = static_cast<int>(k_packed.stride(1)) / (head_dim / 2);
+    const at::ScalarType out_dtype = is_bf16 ? at::kBFloat16 : at::kHalf;
+    TORCH_CHECK(q_len >= 1 && q_len <= 16,
+                "single-query ThriftAttention expects grouped query length in [1, 16], got ",
+                q_len);
+    TORCH_CHECK(q_hi.size(0) == batch && q_hi.size(1) == num_q_heads &&
+                q_hi.size(2) == q_len && q_hi.size(3) == head_dim,
+                "q_hi shape must match packed Q");
+    TORCH_CHECK(selected_blocks.size(0) == flat_q_heads,
+                "selected_blocks first dimension must equal batch * grouped_heads");
+
+    constexpr int block_kv = 64;
+    const int total_kv_blocks = (kv_len + block_kv - 1) / block_kv;
+    TORCH_CHECK(topk_count >= 0 && topk_count <= total_kv_blocks,
+                "selected block count must be in [0, number of KV blocks]");
+
+    if (topk_count == 0) {
+        return fp4_attention_single_query_mxfp4_packed(
+            q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, is_bf16);
+    }
+
+    at::Tensor out = at::empty({batch, num_q_heads, q_len, head_dim},
+        at::TensorOptions().dtype(out_dtype).device(q_packed.device()));
+    const bool use_split = total_kv_blocks >= 64;
+
+    auto dispatch = [&](void* workspace) {
+        thrift_attention_single_query_mxfp4(
             q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
             static_cast<const int32_t*>(selected_blocks.data_ptr()), topk_count,
             q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
@@ -1143,6 +1294,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("v_scale_t"),
           pybind11::arg("is_bf16") = false,
           "Pure MXFP4 non-causal attention over packed tensors");
+    m.def("fp4_attention_single_query_mxfp4_packed", &fp4_attention_single_query_mxfp4_packed,
+          pybind11::arg("q_packed"),
+          pybind11::arg("k_packed"),
+          pybind11::arg("v_packed_t"),
+          pybind11::arg("q_scale"),
+          pybind11::arg("k_scale"),
+          pybind11::arg("v_scale_t"),
+          pybind11::arg("is_bf16") = false,
+          "Pure MXFP4 single-query attention over packed tensors");
     m.def("thrift_attention_causal_nvfp4_packed", &thrift_attention_causal_nvfp4_packed,
           pybind11::arg("q_hi"),
           pybind11::arg("k_hi"),
@@ -1182,6 +1342,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("v_scale_t"),
           pybind11::arg("is_bf16") = false,
           "ThriftAttention single-query attention over packed tensors");
+    m.def("thrift_attention_single_query_mxfp4_packed", &thrift_attention_single_query_mxfp4_packed,
+          pybind11::arg("q_hi"),
+          pybind11::arg("k_hi"),
+          pybind11::arg("v_hi"),
+          pybind11::arg("selected_blocks"),
+          pybind11::arg("q_packed"),
+          pybind11::arg("k_packed"),
+          pybind11::arg("v_packed_t"),
+          pybind11::arg("q_scale"),
+          pybind11::arg("k_scale"),
+          pybind11::arg("v_scale_t"),
+          pybind11::arg("is_bf16") = false,
+          "ThriftAttention single-query attention over MXFP4 packed tensors");
     m.def("thrift_attention_causal_mxfp4_packed", &thrift_attention_causal_mxfp4_packed,
           pybind11::arg("q_hi"),
           pybind11::arg("k_hi"),

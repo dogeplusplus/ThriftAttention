@@ -28,11 +28,63 @@ def _mxfp4_quantize_qkv(
     v: torch.Tensor,
     *,
     is_bf16: bool,
+    permute_k: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q_packed, q_scale = _C.mxfp4_quantize(q, is_bf16)
-    k_packed, k_scale = _C.mxfp4_quantize_permuted(k, is_bf16)
+    if permute_k:
+        k_packed, k_scale = _C.mxfp4_quantize_permuted(k, is_bf16)
+    else:
+        k_packed, k_scale = _C.mxfp4_quantize(k, is_bf16)
     v_packed_t, v_scale_t = _C.mxfp4_quantize_transposed(v, is_bf16)
     return q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("kv_len", CONTEXT_LENGTHS)
+def test_single_query_mxfp4_attention_matches_sdpa(dtype: torch.dtype, kv_len: int) -> None:
+    _requires_sm120_cuda()
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    is_bf16 = dtype == torch.bfloat16
+    batch, q_heads, kv_heads, head_dim = 1, 4, 2, 64
+    groups = q_heads // kv_heads
+
+    q = (torch.randn(batch, q_heads, 1, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
+    k = (torch.randn(batch, kv_heads, kv_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
+    v = (torch.randn(batch, kv_heads, kv_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
+    q_grouped = q.reshape(batch, kv_heads, groups, head_dim).contiguous()
+
+    packed = _mxfp4_quantize_qkv(q_grouped, k, v, is_bf16=is_bf16, permute_k=False)
+    fp4_out = _C.fp4_attention_single_query_mxfp4_packed(*packed, is_bf16)
+    fp4_out = fp4_out.reshape(batch, q_heads, 1, head_dim)
+
+    num_kv_blocks = kv_len // 64
+    k_mean = k.reshape(batch, kv_heads, num_kv_blocks, 64, head_dim).float().mean(dim=3).to(dtype)
+    selected = _C.single_query_key_mean_topk(
+        q_grouped,
+        k_mean.contiguous(),
+        num_kv_blocks,
+        num_kv_blocks,
+        is_bf16,
+    )
+    thrift_out = _C.thrift_attention_single_query_mxfp4_packed(
+        q_grouped,
+        k,
+        v,
+        selected,
+        *packed,
+        is_bf16,
+    ).reshape(batch, q_heads, 1, head_dim)
+
+    k_ref = k.repeat_interleave(groups, dim=1)
+    v_ref = v.repeat_interleave(groups, dim=1)
+    ref = F.scaled_dot_product_attention(q.float(), k_ref.float(), v_ref.float(), is_causal=False)
+
+    torch.cuda.synchronize()
+    assert fp4_out.dtype == dtype
+    assert thrift_out.dtype == dtype
+    assert _cosine(fp4_out, ref) > 0.95
+    assert _cosine(thrift_out, ref) > 0.95
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
