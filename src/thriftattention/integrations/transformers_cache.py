@@ -572,6 +572,8 @@ def cached_decode_attention(
     layer_idx: int,
     config: AttentionConfig,
 ) -> torch.Tensor:
+    if config.quant_format != "nvfp4":
+        raise NotImplementedError("generation cache currently supports quant_format='nvfp4' only")
     layer = cache.layer(layer_idx)
     if layer.seq_len == 0:
         raise RuntimeError("ThriftAttention decode cache is empty")
@@ -627,6 +629,8 @@ def cached_prefill_attention(
     layer_idx: int,
     config: AttentionConfig,
 ) -> torch.Tensor:
+    if config.quant_format != "nvfp4":
+        raise NotImplementedError("generation cache currently supports quant_format='nvfp4' only")
     layer = cache.layer(layer_idx)
     q = query.contiguous()
     is_bf16 = q.dtype == torch.bfloat16

@@ -1,3 +1,3 @@
-from .formats import Nvfp4QuantFormat, QuantFormat, get_quant_format
+from .formats import Mxfp4QuantFormat, Nvfp4QuantFormat, QuantFormat, get_quant_format
 
-__all__ = ["Nvfp4QuantFormat", "QuantFormat", "get_quant_format"]
+__all__ = ["Mxfp4QuantFormat", "Nvfp4QuantFormat", "QuantFormat", "get_quant_format"]

@@ -42,3 +42,35 @@ def nvfp4_quantize_transposed_permuted(x: torch.Tensor, *, is_bf16: bool = False
     _check_dtype_flag("x", x, is_bf16=is_bf16)
     require_supported_head_dim(x.shape[-1])
     return tuple(get_extension().nvfp4_quantize_transposed_permuted(x.contiguous(), is_bf16))
+
+
+def mxfp4_quantize(x: torch.Tensor, *, is_bf16: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a contiguous FP16/BF16 tensor to packed MXFP4 and E8M0 scales."""
+    require_cuda_half("x", x)
+    _check_dtype_flag("x", x, is_bf16=is_bf16)
+    require_supported_head_dim(x.shape[-1])
+    return tuple(get_extension().mxfp4_quantize(x.contiguous(), is_bf16))
+
+
+def mxfp4_quantize_permuted(x: torch.Tensor, *, is_bf16: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize K to packed MXFP4 with Sage-style sequence permutation."""
+    require_cuda_half("x", x)
+    _check_dtype_flag("x", x, is_bf16=is_bf16)
+    require_supported_head_dim(x.shape[-1])
+    return tuple(get_extension().mxfp4_quantize_permuted(x.contiguous(), is_bf16))
+
+
+def mxfp4_quantize_transposed(x: torch.Tensor, *, is_bf16: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize V to the transposed packed MXFP4 layout consumed by attention kernels."""
+    require_cuda_half("x", x)
+    _check_dtype_flag("x", x, is_bf16=is_bf16)
+    require_supported_head_dim(x.shape[-1])
+    return tuple(get_extension().mxfp4_quantize_transposed(x.contiguous(), is_bf16))
+
+
+def mxfp4_quantize_transposed_permuted(x: torch.Tensor, *, is_bf16: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize V to transposed packed MXFP4 with Sage-style sequence permutation."""
+    require_cuda_half("x", x)
+    _check_dtype_flag("x", x, is_bf16=is_bf16)
+    require_supported_head_dim(x.shape[-1])
+    return tuple(get_extension().mxfp4_quantize_transposed_permuted(x.contiguous(), is_bf16))

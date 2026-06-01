@@ -19,7 +19,7 @@ def select_backend(
     require_supported_head_dim(head_dim)
     if config.method not in ("thrift", "fp4"):
         raise NotImplementedError(f"attention method {config.method!r} is not implemented")
-    if quant_format.name != "nvfp4":
+    if quant_format.name not in ("nvfp4", "mxfp4"):
         raise NotImplementedError(f"quant format {quant_format.name!r} is not implemented")
     if config.backend == "auto":
         return _select_auto_backend(device)
