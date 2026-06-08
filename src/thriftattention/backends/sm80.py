@@ -35,7 +35,7 @@ class Sm80Int8Backend:
         if config.method not in ("fp4", "thrift"):
             raise NotImplementedError(
                 f"SM80 backend does not support attention method {config.method!r}; "
-                "use 'fp4' for full INT8 or 'thrift' for selected-block INT8"
+                "use 'int8' for full INT8 or 'thrift' for selected-block INT8"
             )
 
         # SM80 kernels consume FP16/BF16 inputs and perform their own INT8
@@ -62,7 +62,7 @@ class Sm80Int8Backend:
         q_grouped = _group_single_query(q, k.shape[1])
         ext = get_extension()
 
-        if config.method == "fp4":
+        if config.method == "int8":
             out = ext.int8_attention_single_query(q_grouped, k, v, is_bf16)
         else:
             if selection is None:
@@ -92,7 +92,7 @@ class Sm80Int8Backend:
         v = v.contiguous()
         ext = get_extension()
 
-        if config.method == "fp4":
+        if config.method == "int8":
             fn = ext.int8_attention_causal if config.causal else ext.int8_attention_noncausal
             return fn(q, k, v, is_bf16)
 

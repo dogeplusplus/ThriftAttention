@@ -1,9 +1,23 @@
 #include <cstdint>
 #include <float.h>
+#include <cstdio>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #include "thriftattention/sm80/cuda_common.cuh"
+
+template <typename T>
+__device__ inline T int8_attention_from_float(float value);
+
+template <>
+__device__ inline half int8_attention_from_float<half>(float value) {
+    return __float2half(value);
+}
+
+template <>
+__device__ inline __nv_bfloat16 int8_attention_from_float<__nv_bfloat16>(float value) {
+    return __float2bfloat16(value);
+}
 
 template <typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM, int INT8_HEAD_DIM, int SCALE_DIM, int NUM_WARPS, int WARP_Q>
 __global__ void int8_attention_kernel(
@@ -21,35 +35,104 @@ __global__ void int8_attention_kernel(
     int num_q_heads,
     int num_kv_heads
 ) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
     const int q_idx = blockIdx.x;
     const int q_token = q_idx % q_len;
     const int q_head = (q_idx / q_len) % num_q_heads;
     const int batch = q_idx / (q_len * num_q_heads);
+    const int kv_head = q_head * num_kv_heads / num_q_heads;
 
-    const int kv_idx = blockIdx.y;
-    const int kv_token =  kv_idx % kv_len;
-    const int kv_head = q_head * num_kv_heads / num_kv_heads;
+    const int q_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
+    const int o_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
+    const int sq_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * SCALE_DIM;
 
-    float score = 0.0f;
+    // Phase 1: find the largest QK score for numerical stability.
+    float max_score = -INFINITY;
+    for (int kv_token = 0; kv_token < kv_len; kv_token++) {
+        const int k_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * HEAD_DIM;
+        const int sk_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * SCALE_DIM;
 
-    int q_scale_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
-    int k_scale_offset = ((batch * kv_len + kv_token) * num_kv_heads + kv_head) * HEAD_DIM;
-    int v_scale_offset = ((batch * kv_len + kv_token) * num_kv_heads + kv_head) * HEAD_DIM;
+        float score = 0.0f;
+        for (int d = 0; d < HEAD_DIM; d++) {
+            const int group = d / 32;
+            const int q_val = int(Q[q_offset + d]);
+            const int k_val = int(K[k_offset + d]);
+            const float scale = S_Q[sq_offset + group] * S_K[sk_offset + group];
+            score += float(q_val * k_val) * scale;
+        }
 
-    for (int d = 0; d < HEAD_DIM; d++) {
-        int q_val = int(Q[q_offset + d]);
-        int k_val = int(K[k_offset + d]);
+        score *= rsqrtf(float(HEAD_DIM));
+        if constexpr (CAUSAL) {
+            if (kv_token > q_token) {
+                score = -INFINITY;
+            }
+        }
 
-        int group = d / 32;
-        float scale = S_Q[q_scale_offset + group] * S_K[k_scale_offset + group];
-        score += float(q_val * k_val) * scale;
+        max_score = fmaxf(max_score, score);
     }
 
-    // score *= rsqrtf(float(HEAD_DIM));
-    // float max_score = -INFINITY;
-    // for (int d = 0; d < HEAD_DIM; d++) {
+    // Phase 2: compute the softmax denominator.
+    float denom = 0.0f;
+    for (int kv_token = 0; kv_token < kv_len; kv_token++) {
+        const int k_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * HEAD_DIM;
+        const int sk_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * SCALE_DIM;
 
-    // }
+        float score = 0.0f;
+        for (int d = 0; d < HEAD_DIM; d++) {
+            const int group = d / 32;
+            const int q_val = int(Q[q_offset + d]);
+            const int k_val = int(K[k_offset + d]);
+            const float scale = S_Q[sq_offset + group] * S_K[sk_offset + group];
+            score += float(q_val * k_val) * scale;
+        }
+
+        score *= rsqrtf(float(HEAD_DIM));
+        if constexpr (CAUSAL) {
+            if (kv_token > q_token) {
+                score = -INFINITY;
+            }
+        }
+
+        denom += expf(score - max_score);
+    }
+
+    // Phase 3: use softmax probabilities to mix V into each output channel.
+    for (int out_d = 0; out_d < HEAD_DIM; out_d++) {
+        const int v_group = out_d / 32;
+        float acc = 0.0f;
+
+        for (int kv_token = 0; kv_token < kv_len; kv_token++) {
+            const int k_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * HEAD_DIM;
+            const int sk_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * SCALE_DIM;
+            const int v_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * HEAD_DIM;
+            const int sv_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * SCALE_DIM;
+
+            float score = 0.0f;
+            for (int d = 0; d < HEAD_DIM; d++) {
+                const int score_group = d / 32;
+                const int q_val = int(Q[q_offset + d]);
+                const int k_val = int(K[k_offset + d]);
+                const float scale = S_Q[sq_offset + score_group] * S_K[sk_offset + score_group];
+                score += float(q_val * k_val) * scale;
+            }
+
+            score *= rsqrtf(float(HEAD_DIM));
+            if constexpr (CAUSAL) {
+                if (kv_token > q_token) {
+                    score = -INFINITY;
+                }
+            }
+
+            const float p = expf(score - max_score) / denom;
+            const float v_real = float(V[v_offset + out_d]) * S_V[sv_offset + v_group];
+            acc += p * v_real;
+        }
+
+        O[o_offset + out_d] = int8_attention_from_float<T>(acc);
+    }
 }
 
 template <typename T, bool CAUSAL, int HEAD_DIM>
@@ -67,7 +150,7 @@ static void launch_int8_attention(
     constexpr int NUM_WARPS = BLOCK_Q / WARP_Q;
     constexpr int TB_SIZE = NUM_WARPS * TA_WARP_SIZE;
 
-    const int num_blocks = bs * num_q_heads * ta_cdiv(q_len, BLOCK_Q);
+    const int num_blocks = bs * num_q_heads * q_len;
 
     constexpr int q_phase_smem = BLOCK_Q * INT8_HEAD_DIM * sizeof(int8_t) + BLOCK_Q * SCALE_DIM * sizeof(float);
     constexpr int v_phase_smem = BLOCK_KV * INT8_HEAD_DIM * sizeof(int8_t) + BLOCK_KV * SCALE_DIM * sizeof(float);
@@ -77,8 +160,7 @@ static void launch_int8_attention(
 
     auto kernel = int8_attention_kernel<T, CAUSAL, BLOCK_Q, BLOCK_KV, HEAD_DIM, INT8_HEAD_DIM, SCALE_DIM, NUM_WARPS, WARP_Q>;
 
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    kernel<<<num_blocks, TB_SIZE, smem_size>>>(
+    kernel<<<num_blocks, 1>>>(
         Q, K, V, S_Q, S_K, S_V, O,
         bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
 }
