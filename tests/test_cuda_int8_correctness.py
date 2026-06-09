@@ -35,15 +35,24 @@ def test_sm80_mma_m16n8k32_s8_all_ones():
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
-def test_sm80_int8_attention_noncausal_matches_torch():
+@pytest.mark.parametrize(
+    "bs,q_heads,kv_heads,q_len,kv_len,head_dim,test_case", [
+        (1, 1, 1, 64, 64, 64, "matching lengths"),
+        (1, 1, 1, 64, 128, 64, "different lengths"),
+        (1, 8, 4, 64, 64, 64, "q_heads > kv_heads"),
+        (4, 1, 1, 64, 64, 64, "larger batch size"),
+    ]
+)
+def test_sm80_int8_attention_noncausal_matches_torch(
+    bs: int,
+    q_heads: int,
+    kv_heads: int,
+    q_len: int,
+    kv_len: int,
+    head_dim: int,
+    test_case: str,
+):
     ext = get_extension()
-
-    bs = 1
-    q_heads = 1
-    kv_heads = 1
-    q_len = 64
-    kv_len = 64
-    head_dim = 64
 
     q = torch.randn(bs, q_len, q_heads, head_dim, device="cuda", dtype=torch.float16)
     k = torch.randn(bs, kv_len, kv_heads, head_dim, device="cuda", dtype=torch.float16)
@@ -63,8 +72,12 @@ def test_sm80_int8_attention_noncausal_matches_torch():
     k_ref = dequantize_per_32(k_i8, s_k).transpose(1, 2)
     v_ref = dequantize_per_32(v_i8, s_v).transpose(1, 2)
 
+    repeat = q_heads // kv_heads
+    k_ref = k_ref.repeat_interleave(repeat, dim=1)
+    v_ref = v_ref.repeat_interleave(repeat, dim=1)
+
     scores = torch.matmul(q_ref, k_ref.transpose(-1, -2)) / math.sqrt(head_dim)
     probs = torch.softmax(scores, dim=-1)
     expected = torch.matmul(probs, v_ref).transpose(1, 2).half()
 
-    torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2), test_case

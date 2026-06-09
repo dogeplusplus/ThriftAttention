@@ -19,7 +19,7 @@ __device__ inline __nv_bfloat16 int8_attention_from_float<__nv_bfloat16>(float v
     return __float2bfloat16(value);
 }
 
-template <typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM, int INT8_HEAD_DIM, int SCALE_DIM, int NUM_WARPS, int WARP_Q>
+template <typename T, bool CAUSAL, int HEAD_DIM, int INT8_HEAD_DIM, int SCALE_DIM>
 __global__ void int8_attention_kernel(
     const int8_t* Q,
     const int8_t* K,
@@ -144,21 +144,10 @@ static void launch_int8_attention(
 {
     constexpr int INT8_HEAD_DIM = HEAD_DIM;
     constexpr int SCALE_DIM = HEAD_DIM / 32;
-    constexpr int BLOCK_Q = 64;
-    constexpr int BLOCK_KV = 64;
-    constexpr int WARP_Q = 16;
-    constexpr int NUM_WARPS = BLOCK_Q / WARP_Q;
-    constexpr int TB_SIZE = NUM_WARPS * TA_WARP_SIZE;
 
     const int num_blocks = bs * num_q_heads * q_len;
 
-    constexpr int q_phase_smem = BLOCK_Q * INT8_HEAD_DIM * sizeof(int8_t) + BLOCK_Q * SCALE_DIM * sizeof(float);
-    constexpr int v_phase_smem = BLOCK_KV * INT8_HEAD_DIM * sizeof(int8_t) + BLOCK_KV * SCALE_DIM * sizeof(float);
-    constexpr int k_phase_smem = BLOCK_KV * INT8_HEAD_DIM * sizeof(int8_t) + BLOCK_KV * SCALE_DIM * sizeof(float);
-
-    constexpr int smem_size = q_phase_smem + v_phase_smem;
-
-    auto kernel = int8_attention_kernel<T, CAUSAL, BLOCK_Q, BLOCK_KV, HEAD_DIM, INT8_HEAD_DIM, SCALE_DIM, NUM_WARPS, WARP_Q>;
+    auto kernel = int8_attention_kernel<T, CAUSAL, HEAD_DIM, INT8_HEAD_DIM, SCALE_DIM>;
 
     kernel<<<num_blocks, 1>>>(
         Q, K, V, S_Q, S_K, S_V, O,
