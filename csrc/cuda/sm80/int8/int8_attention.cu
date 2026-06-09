@@ -19,6 +19,35 @@ __device__ inline __nv_bfloat16 int8_attention_from_float<__nv_bfloat16>(float v
     return __float2bfloat16(value);
 }
 
+template <int HEAD_DIM, int SCALE_DIM>
+__device__ float compute_int8_score(
+    const int8_t* Q,
+    const int8_t* K,
+    const float* S_Q,
+    const float* S_K,
+    const int q_offset,
+    const int sq_offset,
+    const int batch,
+    const int kv_capacity,
+    const int kv_token,
+    const int num_kv_heads,
+    const int kv_head)
+{
+    const int k_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * HEAD_DIM;
+    const int sk_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * SCALE_DIM;
+
+    float score = 0.0f;
+    for (int d = 0; d < HEAD_DIM; d++) {
+        const int group = d / 32;
+        const int q_val = int(Q[q_offset + d]);
+        const int k_val = int(K[k_offset + d]);
+        const float scale = S_Q[sq_offset + group] * S_K[sk_offset + group];
+        score += float(q_val * k_val) * scale;
+    }
+
+    return score * rsqrtf(float(HEAD_DIM));
+}
+
 template <typename T, bool CAUSAL, int HEAD_DIM, int INT8_HEAD_DIM, int SCALE_DIM>
 __global__ void int8_attention_kernel(
     const int8_t* Q,
@@ -52,19 +81,10 @@ __global__ void int8_attention_kernel(
     // Phase 1: find the largest QK score for numerical stability.
     float max_score = -INFINITY;
     for (int kv_token = 0; kv_token < kv_len; kv_token++) {
-        const int k_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * HEAD_DIM;
-        const int sk_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * SCALE_DIM;
+        float score = compute_int8_score<HEAD_DIM, SCALE_DIM>(
+            Q, K, S_Q, S_K, q_offset, sq_offset, batch, kv_capacity, kv_token,
+            num_kv_heads, kv_head);
 
-        float score = 0.0f;
-        for (int d = 0; d < HEAD_DIM; d++) {
-            const int group = d / 32;
-            const int q_val = int(Q[q_offset + d]);
-            const int k_val = int(K[k_offset + d]);
-            const float scale = S_Q[sq_offset + group] * S_K[sk_offset + group];
-            score += float(q_val * k_val) * scale;
-        }
-
-        score *= rsqrtf(float(HEAD_DIM));
         if constexpr (CAUSAL) {
             if (kv_token > q_token) {
                 score = -INFINITY;
@@ -77,19 +97,10 @@ __global__ void int8_attention_kernel(
     // Phase 2: compute the softmax denominator.
     float denom = 0.0f;
     for (int kv_token = 0; kv_token < kv_len; kv_token++) {
-        const int k_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * HEAD_DIM;
-        const int sk_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * SCALE_DIM;
+        float score = compute_int8_score<HEAD_DIM, SCALE_DIM>(
+            Q, K, S_Q, S_K, q_offset, sq_offset, batch, kv_capacity, kv_token,
+            num_kv_heads, kv_head);
 
-        float score = 0.0f;
-        for (int d = 0; d < HEAD_DIM; d++) {
-            const int group = d / 32;
-            const int q_val = int(Q[q_offset + d]);
-            const int k_val = int(K[k_offset + d]);
-            const float scale = S_Q[sq_offset + group] * S_K[sk_offset + group];
-            score += float(q_val * k_val) * scale;
-        }
-
-        score *= rsqrtf(float(HEAD_DIM));
         if constexpr (CAUSAL) {
             if (kv_token > q_token) {
                 score = -INFINITY;
@@ -105,21 +116,13 @@ __global__ void int8_attention_kernel(
         float acc = 0.0f;
 
         for (int kv_token = 0; kv_token < kv_len; kv_token++) {
-            const int k_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * HEAD_DIM;
-            const int sk_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * SCALE_DIM;
             const int v_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * HEAD_DIM;
             const int sv_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * SCALE_DIM;
 
-            float score = 0.0f;
-            for (int d = 0; d < HEAD_DIM; d++) {
-                const int score_group = d / 32;
-                const int q_val = int(Q[q_offset + d]);
-                const int k_val = int(K[k_offset + d]);
-                const float scale = S_Q[sq_offset + score_group] * S_K[sk_offset + score_group];
-                score += float(q_val * k_val) * scale;
-            }
+            float score = compute_int8_score<HEAD_DIM, SCALE_DIM>(
+                Q, K, S_Q, S_K, q_offset, sq_offset, batch, kv_capacity, kv_token,
+                num_kv_heads, kv_head);
 
-            score *= rsqrtf(float(HEAD_DIM));
             if constexpr (CAUSAL) {
                 if (kv_token > q_token) {
                     score = -INFINITY;
@@ -245,6 +248,37 @@ void int8_attention_noncausal(
     else
     {
         int8_attention_typed<half, false>(
+            Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    }
+}
+
+void int8_attention_causal(
+    const void *Q_raw,
+    const void *K_raw,
+    const void *V_raw,
+    const void *S_Q_raw,
+    const void *S_K_raw,
+    const void *S_V_raw,
+    void *O_raw,
+    int bs,
+    int q_len,
+    int kv_len,
+    int kv_capacity,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    bool is_bf16)
+{
+    if (is_bf16)
+    {
+        int8_attention_typed<__nv_bfloat16, true>(
+            Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    }
+    else
+    {
+        int8_attention_typed<half, true>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
             bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
     }

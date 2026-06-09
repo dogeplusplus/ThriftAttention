@@ -41,6 +41,7 @@ def test_sm80_mma_m16n8k32_s8_all_ones():
         (1, 1, 1, 64, 128, 64, "different lengths"),
         (1, 8, 4, 64, 64, 64, "q_heads > kv_heads"),
         (4, 1, 1, 64, 64, 64, "larger batch size"),
+        (1, 1, 1, 64, 64, 128, "headd dim 128"),
     ]
 )
 def test_sm80_int8_attention_noncausal_matches_torch(
