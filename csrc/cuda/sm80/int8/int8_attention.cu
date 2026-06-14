@@ -177,6 +177,148 @@ __global__ void int8_attention_kernel(
     }
 }
 
+template <typename T, bool CAUSAL, int HEAD_DIM, int INT8_HEAD_DIM, int SCALE_DIM, int BLOCK_Q>
+__global__ void int8_attention_kernel_block_q(
+    const int8_t* Q,
+    const int8_t* K,
+    const int8_t* V,
+    const float* S_Q,
+    const float* S_K,
+    const float* S_V,
+    T* O,
+    int bs,
+    int q_len,
+    int kv_len,
+    int kv_capacity,
+    int num_q_heads,
+    int num_kv_heads
+) {
+    constexpr int KV_CHUNK = 128;
+    const int tid = threadIdx.x;
+    const int q_blocks = ta_cdiv(q_len, BLOCK_Q);
+    const int q_block_idx = blockIdx.x % q_blocks;
+    const int q_head = (blockIdx.x / q_blocks) % num_q_heads;
+    const int batch = blockIdx.x / (q_blocks * num_q_heads);
+    const int kv_head = q_head * num_kv_heads / num_q_heads;
+    const int q_block_start = q_block_idx * BLOCK_Q;
+
+    float running_max[BLOCK_Q];
+    float running_denom[BLOCK_Q];
+    float running_acc[BLOCK_Q];
+    #pragma unroll
+    for (int i = 0; i < BLOCK_Q; i++) {
+        running_max[i] = -INFINITY;
+        running_denom[i] = 0.0f;
+        running_acc[i] = 0.0f;
+    }
+
+    for (int q_i = 0; q_i < BLOCK_Q; q_i++) {
+        const int q_token = q_block_start + q_i;
+        if (q_token >= q_len) {
+            continue;
+        }
+        const int q_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
+        const int o_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
+        const int sq_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * SCALE_DIM;
+
+        __shared__ float scores[KV_CHUNK];
+        __shared__ float reduce_mem[KV_CHUNK];
+
+        const int out_d = tid;
+        const bool has_output = out_d < HEAD_DIM;
+        const int v_group = out_d / 32;
+
+        for (int kv_start = 0; kv_start < kv_len; kv_start += KV_CHUNK) {
+            const int kv_token = kv_start + tid;
+            float score = -INFINITY;
+
+            if (kv_token < kv_len) {
+                score = compute_int8_score<HEAD_DIM, SCALE_DIM>(
+                    Q, K, S_Q, S_K, q_offset, sq_offset, batch, kv_capacity, kv_token,
+                    num_kv_heads, kv_head);
+
+                if constexpr (CAUSAL) {
+                    if (kv_token > q_token) {
+                        score = -INFINITY;
+                    }
+                }
+            }
+
+            scores[tid] = score;
+            reduce_mem[tid] = score;
+            __syncthreads();
+
+            for (int stride = KV_CHUNK / 2; stride > 0; stride /= 2) {
+                if (tid < stride) {
+                    reduce_mem[tid] = fmaxf(reduce_mem[tid], reduce_mem[tid + stride]);
+                }
+                __syncthreads();
+            }
+
+            const float chunk_max = reduce_mem[0];
+            __syncthreads();
+
+            float local_chunk_denom = 0.0f;
+            if (isfinite(score) && isfinite(chunk_max)) {
+                local_chunk_denom = expf(score - chunk_max);
+            }
+
+            reduce_mem[tid] = local_chunk_denom;
+            __syncthreads();
+
+            for (int stride = KV_CHUNK / 2; stride > 0; stride /= 2) {
+                if (tid < stride) {
+                    reduce_mem[tid] += reduce_mem[tid + stride];
+                }
+                __syncthreads();
+            }
+
+            const float chunk_denom = reduce_mem[0];
+            float chunk_acc = 0.0f;
+
+            if (has_output && chunk_denom > 0.0f) {
+                const int chunk_end = min(kv_start + KV_CHUNK, kv_len);
+                for (int token = kv_start; token < chunk_end; token++) {
+                    const int score_idx = token - kv_start;
+                    const float token_score = scores[score_idx];
+                    if (!isfinite(token_score)) {
+                        continue;
+                    }
+
+                    const int v_offset = ((batch * kv_capacity + token) * num_kv_heads + kv_head) * HEAD_DIM;
+                    const int sv_offset = ((batch * kv_capacity + token) * num_kv_heads + kv_head) * SCALE_DIM;
+                    const float weight = expf(token_score - chunk_max);
+                    const float v_real = float(V[v_offset + out_d]) * S_V[sv_offset + v_group];
+                    chunk_acc += weight * v_real;
+                }
+            }
+
+            if (chunk_denom > 0.0f) {
+                if (running_denom[q_i] == 0.0f) {
+                    running_max[q_i] = chunk_max;
+                    running_denom[q_i] = chunk_denom;
+                    running_acc[q_i] = chunk_acc;
+                } else {
+                    const float new_max = fmaxf(running_max[q_i], chunk_max);
+                    const float old_scale = expf(running_max[q_i] - new_max);
+                    const float chunk_scale = expf(chunk_max - new_max);
+
+                    running_acc[q_i] = running_acc[q_i] * old_scale + chunk_acc * chunk_scale;
+                    running_denom[q_i] = running_denom[q_i] * old_scale + chunk_denom * chunk_scale;
+                    running_max[q_i] = new_max;
+                }
+            }
+
+            __syncthreads();
+        }
+
+        if (has_output) {
+            O[o_offset + out_d] = int8_attention_from_float<T>(running_acc[q_i] / running_denom[q_i]);
+        }
+
+    }
+}
+
 template <typename T, bool CAUSAL, int HEAD_DIM>
 static void launch_int8_attention(
     const int8_t *Q, const int8_t *K, const int8_t *V,
@@ -186,10 +328,11 @@ static void launch_int8_attention(
 {
     constexpr int INT8_HEAD_DIM = HEAD_DIM;
     constexpr int SCALE_DIM = HEAD_DIM / 32;
+    constexpr int BLOCK_Q = 4;
 
-    const int num_blocks = bs * num_q_heads * q_len;
-
-    auto kernel = int8_attention_kernel<T, CAUSAL, HEAD_DIM, INT8_HEAD_DIM, SCALE_DIM>;
+    const int q_blocks = ta_cdiv(q_len, BLOCK_Q);
+    const int num_blocks = bs * num_q_heads * q_blocks;
+    auto kernel = int8_attention_kernel_block_q<T, CAUSAL, HEAD_DIM, INT8_HEAD_DIM, SCALE_DIM, BLOCK_Q>;
 
     kernel<<<num_blocks, 128>>>(
         Q, K, V, S_Q, S_K, S_V, O,
