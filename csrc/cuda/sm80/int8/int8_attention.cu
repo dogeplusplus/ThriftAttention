@@ -251,9 +251,13 @@ __global__ void int8_attention_kernel_block_q(
         const int q_i = idx / HEAD_DIM;
         const int d = idx % HEAD_DIM;
         const int q_token = q_block_start + q_i;
-        const int src = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM + d;
 
-        q_chunk[q_i][d] = q_token < q_len ? Q[src] : 0;
+        if (q_token < q_len) {
+            const int src = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM + d;
+            q_chunk[q_i][d] = Q[src];
+        } else {
+            q_chunk[q_i][d] = 0;
+        }
     }
 
     for (int idx = tid; idx < BLOCK_Q * SCALE_DIM; idx += blockDim.x) {
