@@ -6,6 +6,8 @@
 
 #include "thriftattention/sm80/cuda_common.cuh"
 
+#define FULL_MASK 0xffffffff
+
 template <typename T>
 __device__ inline T int8_attention_from_float(float value);
 
@@ -312,6 +314,8 @@ __global__ void int8_attention_kernel_block_q(
             const int q_token = q_block_start + q_i;
             const bool valid_q = q_token < q_len;
             const int local_token = kv_token - kv_start;
+            const int lane = tid % 32;
+            const int warp = tid / 32;
 
             if (valid_q && kv_token < kv_len) {
                 score = compute_int8_score_from_chunk<HEAD_DIM, SCALE_DIM>(
@@ -325,35 +329,62 @@ __global__ void int8_attention_kernel_block_q(
             }
 
             scores[tid] = score;
-            reduce_mem[tid] = score;
-            __syncthreads();
-
-            for (int stride = KV_CHUNK / 2; stride > 0; stride /= 2) {
-                if (tid < stride) {
-                    reduce_mem[tid] = fmaxf(reduce_mem[tid], reduce_mem[tid + stride]);
-                }
-                __syncthreads();
+            
+            float warp_max = score;
+            for (int offset = 16; offset > 0; offset /= 2) {
+                warp_max  = fmax(warp_max, __shfl_down_sync(FULL_MASK, warp_max, offset));
             }
 
-            const float chunk_max = reduce_mem[0];
+            if (lane == 0) {
+                reduce_mem[warp] = warp_max;
+            }
             __syncthreads();
+
+            float block_max = -INFINITY;
+            if (warp == 0) {
+                block_max = lane < 4 ? reduce_mem[lane] : -INFINITY;
+
+                for (int offset = 16; offset > 0; offset /= 2) {
+                    block_max = fmaxf(block_max, __shfl_down_sync(FULL_MASK, block_max, offset));
+                }
+
+                if (lane == 0) {
+                    reduce_mem[0] = block_max;
+                }
+            }
+            
+            __syncthreads();
+            const float chunk_max = reduce_mem[0];
 
             float local_chunk_denom = 0.0f;
             if (isfinite(score) && isfinite(chunk_max)) {
                 local_chunk_denom = expf(score - chunk_max);
             }
 
-            reduce_mem[tid] = local_chunk_denom;
-            __syncthreads();
-
-            for (int stride = KV_CHUNK / 2; stride > 0; stride /= 2) {
-                if (tid < stride) {
-                    reduce_mem[tid] += reduce_mem[tid + stride];
-                }
-                __syncthreads();
+            float warp_sum = local_chunk_denom;
+            for (int offset = 16; offset > 0; offset /= 2) {
+                warp_sum += __shfl_down_sync(FULL_MASK, warp_sum, offset);
             }
 
+            if (lane == 0) {
+                reduce_mem[warp] = warp_sum;
+            }
+            __syncthreads();
+
+            float block_sum = 0.0f;
+            if (warp == 0) {
+                block_sum = lane < 4 ? reduce_mem[lane] : 0.0f;
+                for (int offset = 16; offset > 0; offset /= 2) {
+                    block_sum += __shfl_down_sync(FULL_MASK, block_sum, offset);                    
+                }
+                if (lane == 0) {
+                    reduce_mem[0] = block_sum;
+                }
+            }
+            __syncthreads();
+
             const float chunk_denom = reduce_mem[0];
+
             float chunk_acc = 0.0f;
             const int v_group = out_d / 32;
 
