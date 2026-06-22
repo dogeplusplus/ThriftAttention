@@ -34,6 +34,17 @@ def test_sm80_mma_m16n8k32_s8_all_ones():
 
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
+def test_sm80_mma_m16n8k32_s8_random():
+    ext = get_extension()
+
+    a = torch.randint(-128, 128, (16, 32), device="cuda", dtype=torch.int8)
+    b = torch.randint(-128, 128, (32, 8), device="cuda", dtype=torch.int8)
+
+    out = ext.sm80_mma_m16n8k32_s8_test(a, b)
+    expected = (a.cpu().int() @ b.cpu().int()).to(out.device)
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
 
 @pytest.mark.parametrize(
     "bs,q_heads,kv_heads,q_len,kv_len,head_dim,test_case", [
